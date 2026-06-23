@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "build": "npm run dev",
+    "build": "npm run start",
     "test": "jest"
   },
   "keywords": ["landlord", "property", "saas", "mortgages", "tenants"],
