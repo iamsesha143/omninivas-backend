@@ -5,17 +5,42 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const multer = require('multer');
+const vision = require('@google-cloud/vision');
+const Anthropic = require('@anthropic-ai/sdk');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb' }));
+
+// Multer for file uploads
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+// Initialize Google Vision and Anthropic
+const visionClient = new vision.ImageAnnotatorClient();
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
+});
+
+// Supabase Client
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key';
+
+// ============================================================================
+// MIDDLEWARE
+// ============================================================================
 
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -29,21 +54,33 @@ const verifyToken = (req, res, next) => {
   }
 };
 
+// ============================================================================
+// HEALTH CHECK
+// ============================================================================
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP 2', timestamp: new Date().toISOString() });
 });
+
+// ============================================================================
+// AUTH ENDPOINTS
+// ============================================================================
 
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, full_name, phone_number } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
     const hashedPassword = await bcrypt.hash(password, 10);
     const whatsappToken = crypto.randomBytes(32).toString('hex');
+
     const { data, error } = await supabase
       .from('users')
       .insert([{ email, full_name, phone_number, whatsapp_webhook_token: whatsappToken }])
       .select();
+
     if (error) return res.status(400).json({ error: error.message });
+
     const token = jwt.sign({ sub: data[0].id, email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ user: data[0], token, whatsappToken });
   } catch (err) {
@@ -55,12 +92,15 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
     const { data, error } = await supabase
       .from('users')
       .select('*')
       .eq('email', email)
       .single();
+
     if (error || !data) return res.status(401).json({ error: 'Invalid email or password' });
+
     const token = jwt.sign({ sub: data.id, email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ user: data, token });
   } catch (err) {
@@ -75,6 +115,7 @@ app.get('/api/user', verifyToken, async (req, res) => {
       .select('*')
       .eq('id', req.userId)
       .single();
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -82,9 +123,113 @@ app.get('/api/user', verifyToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// MVP 2: DOCUMENT EXTRACTION
+// ============================================================================
+
+app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+    const fileExt = path.extname(fileName).toLowerCase();
+
+    let extractedText = '';
+
+    if (['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(fileExt)) {
+      const request = {
+        image: {
+          content: fileBuffer,
+        },
+      };
+
+      const [result] = await visionClient.documentTextDetection(request);
+      const fullTextAnnotation = result.fullTextAnnotation;
+      extractedText = fullTextAnnotation ? fullTextAnnotation.text : '';
+    } else if (fileExt === '.pdf') {
+      return res.status(400).json({ 
+        error: 'Please upload agreement as image (JPG/PNG). PDF support coming soon.',
+        suggestion: 'Convert PDF to image using any online tool and re-upload'
+      });
+    }
+
+    if (!extractedText) {
+      return res.status(400).json({ error: 'Could not extract text from image' });
+    }
+
+    // Parse extracted text using Claude to get structured data
+    const parsePrompt = `Extract structured tenant and rental information from this rental agreement text. Return ONLY valid JSON with these exact keys (use null for missing values):
+
+{
+  "tenant_name": "string",
+  "tenant_age": "number or null",
+  "tenant_gender": "string or null",
+  "tenant_email": "string or null",
+  "tenant_phone": "string or null",
+  "monthly_rent": "number or null",
+  "security_deposit": "number or null",
+  "maintenance_charges": "number or null",
+  "maintenance_includes": "string or null",
+  "other_charges": "string or null",
+  "other_charges_amount": "number or null",
+  "payment_due_date": "number or null (1-31)",
+  "agreement_start_date": "string in YYYY-MM-DD or null",
+  "agreement_end_date": "string in YYYY-MM-DD or null",
+  "co_tenants": [
+    {
+      "name": "string",
+      "age": "number or null",
+      "gender": "string or null",
+      "phone": "string or null",
+      "relationship": "string or null"
+    }
+  ]
+}
+
+Agreement text:
+${extractedText}`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 1024,
+      messages: [
+        { role: 'user', content: parsePrompt }
+      ]
+    });
+
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+    
+    // Extract JSON from response
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return res.status(400).json({ error: 'Could not parse agreement structure' });
+    }
+
+    const extractedData = JSON.parse(jsonMatch[0]);
+
+    res.json({
+      success: true,
+      extractedText: extractedText.substring(0, 500) + '...',
+      extractedData: extractedData
+    });
+
+  } catch (err) {
+    console.error('Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// PROPERTIES ENDPOINTS
+// ============================================================================
+
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, property_type, flat_number, society_name, street_address, city, state, pincode, constructed_area_sqft, carpet_area_sqft, total_floors, current_floor, parking_slots, year_built, society_contact_name, society_contact_phone } = req.body;
+
     const { data, error } = await supabase
       .from('properties')
       .insert([{
@@ -107,6 +252,7 @@ app.post('/api/properties', verifyToken, async (req, res) => {
         society_contact_phone
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -120,6 +266,7 @@ app.get('/api/properties', verifyToken, async (req, res) => {
       .from('properties')
       .select('*')
       .eq('user_id', req.userId);
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -135,6 +282,7 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -150,6 +298,7 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .select();
+
     if (error) throw error;
     res.json(data[0]);
   } catch (err) {
@@ -157,10 +306,15 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// TENANTS ENDPOINTS
+// ============================================================================
+
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
     const { propertyId } = req.params;
     const { name, age, gender, pan_card, aadhar_card, personal_email, personal_phone, permanent_address, occupancy_type, number_of_occupants, emergency_contact_name, emergency_contact_phone, emergency_contact_relationship, date_of_move_in } = req.body;
+
     const { data, error } = await supabase
       .from('tenants')
       .insert([{
@@ -183,6 +337,7 @@ app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) =>
         is_active: true
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -198,6 +353,7 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
       .select('*')
       .eq('property_id', propertyId)
       .eq('user_id', req.userId);
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -213,6 +369,7 @@ app.get('/api/tenants/:id', verifyToken, async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .single();
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -228,6 +385,7 @@ app.patch('/api/tenants/:id', verifyToken, async (req, res) => {
       .eq('id', req.params.id)
       .eq('user_id', req.userId)
       .select();
+
     if (error) throw error;
     res.json(data[0]);
   } catch (err) {
@@ -239,6 +397,7 @@ app.post('/api/tenants/:tenantId/co-tenants', verifyToken, async (req, res) => {
   try {
     const { tenantId } = req.params;
     const { name, age, gender, relationship, pan_card, aadhar_card, phone, email } = req.body;
+
     const { data, error } = await supabase
       .from('co_tenants')
       .insert([{
@@ -253,6 +412,7 @@ app.post('/api/tenants/:tenantId/co-tenants', verifyToken, async (req, res) => {
         email
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -260,10 +420,15 @@ app.post('/api/tenants/:tenantId/co-tenants', verifyToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// RENTAL AGREEMENTS
+// ============================================================================
+
 app.post('/api/properties/:propertyId/rental-agreements', verifyToken, async (req, res) => {
   try {
     const { propertyId } = req.params;
     const { tenant_id, monthly_rent, security_deposit, maintenance_charges, maintenance_includes_text, other_charges_description, other_charges_amount, payment_due_date, rent_increase_percentage, rent_increase_month, agreement_start_date, agreement_end_date } = req.body;
+
     const { data, error } = await supabase
       .from('rental_agreements')
       .insert([{
@@ -284,6 +449,7 @@ app.post('/api/properties/:propertyId/rental-agreements', verifyToken, async (re
         is_active: true
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -299,6 +465,7 @@ app.get('/api/properties/:propertyId/rental-agreements', verifyToken, async (req
       .select('*')
       .eq('property_id', propertyId)
       .eq('user_id', req.userId);
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -306,40 +473,15 @@ app.get('/api/properties/:propertyId/rental-agreements', verifyToken, async (req
   }
 });
 
-app.get('/api/rental-agreements/:id', verifyToken, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('rental_agreements')
-      .select('*')
-      .eq('id', req.params.id)
-      .eq('user_id', req.userId)
-      .single();
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/api/rental-agreements/:id', verifyToken, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('rental_agreements')
-      .update(req.body)
-      .eq('id', req.params.id)
-      .eq('user_id', req.userId)
-      .select();
-    if (error) throw error;
-    res.json(data[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// ============================================================================
+// MAINTENANCE COSTS
+// ============================================================================
 
 app.post('/api/properties/:propertyId/maintenance-costs', verifyToken, async (req, res) => {
   try {
     const { propertyId } = req.params;
     const { tenant_id, cost_type, description, amount, paid_by, owner_share, tenant_share, maintenance_date, category, vendor_name, vendor_phone } = req.body;
+
     const { data, error } = await supabase
       .from('maintenance_costs')
       .insert([{
@@ -358,6 +500,7 @@ app.post('/api/properties/:propertyId/maintenance-costs', verifyToken, async (re
         vendor_phone
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -374,6 +517,7 @@ app.get('/api/properties/:propertyId/maintenance-costs', verifyToken, async (req
       .eq('property_id', propertyId)
       .eq('user_id', req.userId)
       .order('maintenance_date', { ascending: false });
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -381,10 +525,15 @@ app.get('/api/properties/:propertyId/maintenance-costs', verifyToken, async (req
   }
 });
 
+// ============================================================================
+// OTHER COSTS
+// ============================================================================
+
 app.post('/api/properties/:propertyId/other-costs', verifyToken, async (req, res) => {
   try {
     const { propertyId } = req.params;
     const { tenant_id, cost_type, description, amount, billing_month, billing_year, paid_by, owner_share, tenant_share } = req.body;
+
     const { data, error } = await supabase
       .from('other_costs')
       .insert([{
@@ -401,6 +550,7 @@ app.post('/api/properties/:propertyId/other-costs', verifyToken, async (req, res
         tenant_share: parseFloat(tenant_share || 0)
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -416,6 +566,7 @@ app.get('/api/properties/:propertyId/other-costs', verifyToken, async (req, res)
       .select('*')
       .eq('property_id', propertyId)
       .eq('user_id', req.userId);
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -423,10 +574,15 @@ app.get('/api/properties/:propertyId/other-costs', verifyToken, async (req, res)
   }
 });
 
+// ============================================================================
+// PAYMENTS
+// ============================================================================
+
 app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
   try {
     const { propertyId } = req.params;
     const { tenant_id, payment_type, description, amount, payment_date, payment_method, utr_number, cheque_number } = req.body;
+
     const { data, error } = await supabase
       .from('payments')
       .insert([{
@@ -442,6 +598,7 @@ app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) =
         cheque_number
       }])
       .select();
+
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -458,6 +615,7 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
       .eq('property_id', propertyId)
       .eq('user_id', req.userId)
       .order('payment_date', { ascending: false });
+
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -465,21 +623,9 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
   }
 });
 
-app.get('/api/tenants/:tenantId/payment-history', verifyToken, async (req, res) => {
-  try {
-    const { tenantId } = req.params;
-    const { data, error } = await supabase
-      .from('payments')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .eq('user_id', req.userId)
-      .order('payment_date', { ascending: false });
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// ============================================================================
+// DASHBOARD
+// ============================================================================
 
 app.get('/api/properties/:propertyId/dashboard', verifyToken, async (req, res) => {
   try {
@@ -490,24 +636,29 @@ app.get('/api/properties/:propertyId/dashboard', verifyToken, async (req, res) =
       .eq('id', propertyId)
       .eq('user_id', req.userId)
       .single();
+
     const { data: tenantData } = await supabase
       .from('tenants')
       .select('*')
       .eq('property_id', propertyId)
       .eq('is_active', true);
+
     const { data: agreementData } = await supabase
       .from('rental_agreements')
       .select('*')
       .eq('property_id', propertyId)
       .eq('is_active', true);
+
     const currentDate = new Date();
     const { data: maintenanceData } = await supabase
       .from('maintenance_costs')
       .select('*')
       .eq('property_id', propertyId)
       .gte('maintenance_date', `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}-01`);
+
     const totalMonthlyRevenue = agreementData ? agreementData.reduce((sum, a) => sum + parseFloat(a.monthly_rent || 0), 0) : 0;
     const maintenanceThisMonth = maintenanceData ? maintenanceData.reduce((sum, m) => sum + parseFloat(m.amount || 0), 0) : 0;
+
     res.json({
       property: propData,
       active_tenants_count: tenantData ? tenantData.length : 0,
@@ -522,103 +673,9 @@ app.get('/api/properties/:propertyId/dashboard', verifyToken, async (req, res) =
   }
 });
 
-app.get('/api/properties/:propertyId/tenant-summary/:tenantId', verifyToken, async (req, res) => {
-  try {
-    const { propertyId, tenantId } = req.params;
-    const { data: tenantData } = await supabase
-      .from('tenants')
-      .select('*')
-      .eq('id', tenantId)
-      .single();
-    const { data: agreementData } = await supabase
-      .from('rental_agreements')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .single();
-    const { data: paymentData } = await supabase
-      .from('payments')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .eq('user_id', req.userId);
-    const { data: maintenanceData } = await supabase
-      .from('maintenance_costs')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .eq('user_id', req.userId);
-    const totalPaid = paymentData ? paymentData.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0) : 0;
-    const totalMaintenance = maintenanceData ? maintenanceData.reduce((sum, m) => sum + parseFloat(m.tenant_share || 0), 0) : 0;
-    res.json({
-      tenant: tenantData,
-      agreement: agreementData,
-      payments: paymentData,
-      maintenance_costs: maintenanceData,
-      total_paid: totalPaid,
-      total_maintenance_paid: totalMaintenance
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/properties/:propertyId/financial-summary', verifyToken, async (req, res) => {
-  try {
-    const { propertyId } = req.params;
-    const { data: maintenanceData } = await supabase
-      .from('maintenance_costs')
-      .select('*')
-      .eq('property_id', propertyId)
-      .eq('user_id', req.userId);
-    const { data: otherCostsData } = await supabase
-      .from('other_costs')
-      .select('*')
-      .eq('property_id', propertyId)
-      .eq('user_id', req.userId);
-    const { data: paymentData } = await supabase
-      .from('payments')
-      .select('*')
-      .eq('property_id', propertyId)
-      .eq('user_id', req.userId);
-    const costByType = {};
-    if (maintenanceData) {
-      maintenanceData.forEach(m => {
-        if (!costByType[m.cost_type]) costByType[m.cost_type] = 0;
-        costByType[m.cost_type] += parseFloat(m.amount || 0);
-      });
-    }
-    if (otherCostsData) {
-      otherCostsData.forEach(o => {
-        if (!costByType[o.cost_type]) costByType[o.cost_type] = 0;
-        costByType[o.cost_type] += parseFloat(o.amount || 0);
-      });
-    }
-    const totalRevenue = paymentData ? paymentData.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0) : 0;
-    const totalCosts = (maintenanceData ? maintenanceData.reduce((sum, m) => sum + parseFloat(m.amount || 0), 0) : 0) + (otherCostsData ? otherCostsData.reduce((sum, o) => sum + parseFloat(o.amount || 0), 0) : 0);
-    res.json({
-      total_revenue: totalRevenue,
-      total_costs: totalCosts,
-      net_income: totalRevenue - totalCosts,
-      cost_by_type: costByType,
-      payments: paymentData
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/webhooks/whatsapp', (req, res) => {
-  const verifyToken = process.env.WEBHOOK_VERIFY_TOKEN || 'verify-token-123';
-  const challenge = req.query['hub.challenge'];
-  const token = req.query['hub.verify_token'];
-  if (token === verifyToken) {
-    res.status(200).send(challenge);
-  } else {
-    res.status(403).json({ error: 'Invalid verification token' });
-  }
-});
-
-app.post('/api/webhooks/whatsapp', (req, res) => {
-  res.status(200).json({ received: true });
-});
+// ============================================================================
+// START SERVER
+// ============================================================================
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`OMniNivas Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`OMniNivas Backend (MVP 2) running on port ${PORT}`));
