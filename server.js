@@ -17,10 +17,11 @@ app.use(express.urlencoded({ limit: '50mb' }));
 // Multer setup
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-// Supabase
+// Supabase - DISABLE REALTIME
 const supabase = createClient(
   process.env.SUPABASE_URL || '',
-  process.env.SUPABASE_KEY || ''
+  process.env.SUPABASE_KEY || '',
+  { realtime: { enabled: false } }
 );
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
@@ -234,13 +235,12 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
   }
 });
 
-// ===== DOCUMENT EXTRACTION (Claude) =====
+// ===== DOCUMENT EXTRACTION =====
 
 app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    // Simple placeholder response - Claude integration will be added later
     res.json({
       success: true,
       extractedData: {
