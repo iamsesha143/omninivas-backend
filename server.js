@@ -6,27 +6,24 @@ const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
+const ws = require('ws');
 
 const app = express();
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb' }));
 
-// Multer setup
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-// Supabase - DISABLE REALTIME
 const supabase = createClient(
   process.env.SUPABASE_URL || '',
   process.env.SUPABASE_KEY || '',
-  { realtime: { enabled: false } }
+  { realtime: { transport: ws } }
 );
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
 
-// Verify token middleware
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
@@ -39,27 +36,17 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', version: 'MVP2', time: new Date().toISOString() });
 });
-
-// ===== AUTH =====
 
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, full_name, phone_number } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-
-    const hashed = await bcrypt.hash(password, 10);
-
-    const { data, error } = await supabase
-      .from('users')
-      .insert([{ email, full_name, phone_number, whatsapp_webhook_token: crypto.randomBytes(16).toString('hex') }])
-      .select();
-
+    await bcrypt.hash(password, 10);
+    const { data, error } = await supabase.from('users').insert([{ email, full_name, phone_number, whatsapp_webhook_token: crypto.randomBytes(16).toString('hex') }]).select();
     if (error) throw error;
-
     const token = jwt.sign({ sub: data[0].id, email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ user: data[0], token });
   } catch (err) {
@@ -70,10 +57,8 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-
     const { data, error } = await supabase.from('users').select('*').eq('email', email).single();
     if (error || !data) return res.status(401).json({ error: 'Invalid credentials' });
-
     const token = jwt.sign({ sub: data.id, email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ user: data, token });
   } catch (err) {
@@ -81,15 +66,10 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// ===== PROPERTIES =====
-
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, city, street_address } = req.body;
-    const { data, error } = await supabase
-      .from('properties')
-      .insert([{ user_id: req.userId, property_name, city, street_address }])
-      .select();
+    const { data, error } = await supabase.from('properties').insert([{ user_id: req.userId, property_name, city, street_address }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -109,12 +89,7 @@ app.get('/api/properties', verifyToken, async (req, res) => {
 
 app.get('/api/properties/:id', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('properties')
-      .select('*')
-      .eq('id', req.params.id)
-      .eq('user_id', req.userId)
-      .single();
+    const { data, error } = await supabase.from('properties').select('*').eq('id', req.params.id).eq('user_id', req.userId).single();
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -122,23 +97,10 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== TENANTS =====
-
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
     const { name, personal_email, personal_phone, date_of_move_in } = req.body;
-    const { data, error } = await supabase
-      .from('tenants')
-      .insert([{
-        property_id: req.params.propertyId,
-        user_id: req.userId,
-        name,
-        personal_email,
-        personal_phone,
-        date_of_move_in,
-        is_active: true
-      }])
-      .select();
+    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name, personal_email, personal_phone, date_of_move_in, is_active: true }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -148,11 +110,7 @@ app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) =>
 
 app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('tenants')
-      .select('*')
-      .eq('property_id', req.params.propertyId)
-      .eq('user_id', req.userId);
+    const { data, error } = await supabase.from('tenants').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId);
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -160,24 +118,10 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   }
 });
 
-// ===== RENTAL AGREEMENTS =====
-
 app.post('/api/properties/:propertyId/rental-agreements', verifyToken, async (req, res) => {
   try {
     const { tenant_id, monthly_rent, security_deposit, agreement_start_date, agreement_end_date } = req.body;
-    const { data, error } = await supabase
-      .from('rental_agreements')
-      .insert([{
-        property_id: req.params.propertyId,
-        tenant_id,
-        user_id: req.userId,
-        monthly_rent: parseFloat(monthly_rent),
-        security_deposit: parseFloat(security_deposit || 0),
-        agreement_start_date,
-        agreement_end_date,
-        is_active: true
-      }])
-      .select();
+    const { data, error } = await supabase.from('rental_agreements').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, monthly_rent: parseFloat(monthly_rent), security_deposit: parseFloat(security_deposit || 0), agreement_start_date, agreement_end_date, is_active: true }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -187,11 +131,7 @@ app.post('/api/properties/:propertyId/rental-agreements', verifyToken, async (re
 
 app.get('/api/properties/:propertyId/rental-agreements', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('rental_agreements')
-      .select('*')
-      .eq('property_id', req.params.propertyId)
-      .eq('user_id', req.userId);
+    const { data, error } = await supabase.from('rental_agreements').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId);
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -199,21 +139,10 @@ app.get('/api/properties/:propertyId/rental-agreements', verifyToken, async (req
   }
 });
 
-// ===== PAYMENTS =====
-
 app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
   try {
     const { tenant_id, amount, payment_date } = req.body;
-    const { data, error } = await supabase
-      .from('payments')
-      .insert([{
-        property_id: req.params.propertyId,
-        tenant_id,
-        user_id: req.userId,
-        amount: parseFloat(amount),
-        payment_date
-      }])
-      .select();
+    const { data, error } = await supabase.from('payments').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, amount: parseFloat(amount), payment_date }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -223,11 +152,7 @@ app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) =
 
 app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('payments')
-      .select('*')
-      .eq('property_id', req.params.propertyId)
-      .eq('user_id', req.userId);
+    const { data, error } = await supabase.from('payments').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId);
     if (error) throw error;
     res.json(data);
   } catch (err) {
@@ -235,35 +160,16 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
   }
 });
 
-// ===== DOCUMENT EXTRACTION =====
-
 app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-
-    res.json({
-      success: true,
-      extractedData: {
-        tenant_name: 'John Doe',
-        tenant_email: 'john@example.com',
-        tenant_phone: '9876543210',
-        monthly_rent: 20000,
-        agreement_start_date: new Date().toISOString().split('T')[0]
-      }
-    });
+    res.json({ success: true, extractedData: { tenant_name: 'John Doe', tenant_email: 'john@example.com', tenant_phone: '9876543210', monthly_rent: 20000, agreement_start_date: new Date().toISOString().split('T')[0] } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Error handler
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: 'Server error' });
-});
+app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }); });
 
-// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ OMniNivas Backend running on port ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT}`); });
