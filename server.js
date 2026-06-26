@@ -7,6 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 
@@ -21,6 +22,10 @@ const supabase = createClient(
   process.env.SUPABASE_KEY || '',
   { realtime: { transport: ws } }
 );
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY || ''
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
 
@@ -163,8 +168,53 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
 app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    res.json({ success: true, extractedData: { tenant_name: 'John Doe', tenant_email: 'john@example.com', tenant_phone: '9876543210', monthly_rent: 20000, agreement_start_date: new Date().toISOString().split('T')[0] } });
+
+    const base64Data = req.file.buffer.toString('base64');
+    const mimeType = req.file.mimetype || 'image/jpeg';
+
+    const prompt = `Extract tenant and rental information from this rental agreement image. Return ONLY valid JSON:
+{
+  "tenant_name": "string or null",
+  "tenant_email": "string or null",
+  "tenant_phone": "string or null",
+  "monthly_rent": "number or null",
+  "security_deposit": "number or null",
+  "agreement_start_date": "YYYY-MM-DD or null",
+  "agreement_end_date": "YYYY-MM-DD or null"
+}`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 256,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: mimeType,
+                data: base64Data
+              }
+            },
+            {
+              type: 'text',
+              text: prompt
+            }
+          ]
+        }
+      ]
+    });
+
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return res.status(400).json({ error: 'Could not parse agreement' });
+
+    const extractedData = JSON.parse(jsonMatch[0]);
+    res.json({ success: true, extractedData });
   } catch (err) {
+    console.error('Error:', err);
     res.status(500).json({ error: err.message });
   }
 });
