@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
 const Anthropic = require('@anthropic-ai/sdk');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 
@@ -42,7 +43,7 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-MultiTenant', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-MultiTenant-PDF', time: new Date().toISOString() });
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -103,26 +104,72 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
+// Helper function to extract text from PDF
+const extractPdfText = async (buffer) => {
+  try {
+    const data = await pdfParse(buffer);
+    return data.text;
+  } catch (err) {
+    throw new Error('Failed to parse PDF: ' + err.message);
+  }
+};
+
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    const base64Data = req.file.buffer.toString('base64');
-    const mimeType = req.file.mimetype || 'image/jpeg';
-    const prompt = `Extract property information from this sale deed or rental agreement image. Return ONLY valid JSON:
+
+    let prompt, message;
+    const isPdf = req.file.mimetype === 'application/pdf';
+
+    if (isPdf) {
+      // Extract text from PDF
+      const pdfText = await extractPdfText(req.file.buffer);
+      prompt = `Extract property information from this rental agreement or sale deed text. Return ONLY valid JSON:
+{
+  "property_name": "string or null",
+  "street_address": "full address or null",
+  "city": "city name or null",
+  "property_type": "residential/commercial or null"
+}
+
+TEXT FROM DOCUMENT:
+${pdfText}`;
+
+      message = await anthropic.messages.create({
+        model: 'claude-opus-4-6',
+        max_tokens: 256,
+        messages: [{ role: 'user', content: prompt }]
+      });
+    } else {
+      // Image processing (existing logic)
+      const base64Data = req.file.buffer.toString('base64');
+      const mimeType = req.file.mimetype || 'image/jpeg';
+
+      prompt = `Extract property information from this sale deed or rental agreement image. Return ONLY valid JSON:
 {
   "property_name": "string or null",
   "street_address": "full address or null",
   "city": "city name or null",
   "property_type": "residential/commercial or null"
 }`;
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 256,
-      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } }, { type: 'text', text: prompt }] }]
-    });
+
+      message = await anthropic.messages.create({
+        model: 'claude-opus-4-6',
+        max_tokens: 256,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } },
+            { type: 'text', text: prompt }
+          ]
+        }]
+      });
+    }
+
     const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return res.status(400).json({ error: 'Could not extract property info' });
+
     const extractedData = JSON.parse(jsonMatch[0]);
     res.json({ success: true, extractedData });
   } catch (err) {
@@ -177,9 +224,40 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    const base64Data = req.file.buffer.toString('base64');
-    const mimeType = req.file.mimetype || 'image/jpeg';
-    const prompt = `Extract ALL tenant information from this rental agreement image. Return ONLY valid JSON:
+
+    let prompt, message;
+    const isPdf = req.file.mimetype === 'application/pdf';
+
+    if (isPdf) {
+      // Extract text from PDF
+      const pdfText = await extractPdfText(req.file.buffer);
+      prompt = `Extract ALL tenant information from this rental agreement text. Return ONLY valid JSON:
+{
+  "tenants": [
+    {
+      "name": "string or null",
+      "personal_email": "string or null",
+      "personal_phone": "string or null",
+      "date_of_move_in": "YYYY-MM-DD or null"
+    }
+  ]
+}
+Important: Extract ALL tenants listed. Include co-tenants/roommates.
+
+TEXT FROM DOCUMENT:
+${pdfText}`;
+
+      message = await anthropic.messages.create({
+        model: 'claude-opus-4-6',
+        max_tokens: 512,
+        messages: [{ role: 'user', content: prompt }]
+      });
+    } else {
+      // Image processing (existing logic)
+      const base64Data = req.file.buffer.toString('base64');
+      const mimeType = req.file.mimetype || 'image/jpeg';
+
+      prompt = `Extract ALL tenant information from this rental agreement image. Return ONLY valid JSON:
 {
   "tenants": [
     {
@@ -191,14 +269,24 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
   ]
 }
 Important: Extract ALL tenants listed. Include co-tenants/roommates.`;
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 512,
-      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } }, { type: 'text', text: prompt }] }]
-    });
+
+      message = await anthropic.messages.create({
+        model: 'claude-opus-4-6',
+        max_tokens: 512,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } },
+            { type: 'text', text: prompt }
+          ]
+        }]
+      });
+    }
+
     const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return res.status(400).json({ error: 'Could not extract tenant info' });
+
     const extractedData = JSON.parse(jsonMatch[0]);
     res.json({ success: true, extractedData });
   } catch (err) {
