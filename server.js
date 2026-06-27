@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb' }));
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 const supabase = createClient(
   process.env.SUPABASE_URL || '',
@@ -42,8 +42,10 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-Full', time: new Date().toISOString() });
 });
+
+// ===== AUTH =====
 
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -71,10 +73,19 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ===== PROPERTIES =====
+
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, city, street_address } = req.body;
-    const { data, error } = await supabase.from('properties').insert([{ user_id: req.userId, property_name, city, street_address }]).select();
+    if (!property_name || !city) return res.status(400).json({ error: 'Property name and city required' });
+    
+    const { data, error } = await supabase.from('properties').insert([{ 
+      user_id: req.userId, 
+      property_name: property_name.trim(), 
+      city: city.trim(), 
+      street_address: street_address ? street_address.trim() : '' 
+    }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -86,7 +97,7 @@ app.get('/api/properties', verifyToken, async (req, res) => {
   try {
     const { data, error } = await supabase.from('properties').select('*').eq('user_id', req.userId);
     if (error) throw error;
-    res.json(data);
+    res.json(data || []);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -102,10 +113,63 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
+// ===== EXTRACT PROPERTY FROM DEED/AGREEMENT =====
+
+app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+
+    const base64Data = req.file.buffer.toString('base64');
+    const mimeType = req.file.mimetype || 'image/jpeg';
+
+    const prompt = `Extract property information from this sale deed or rental agreement image. Return ONLY valid JSON:
+{
+  "property_name": "string or null",
+  "street_address": "full address or null",
+  "city": "city name or null",
+  "property_type": "residential/commercial or null"
+}`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 256,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } },
+          { type: 'text', text: prompt }
+        ]
+      }]
+    });
+
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return res.status(400).json({ error: 'Could not extract property info' });
+
+    const extractedData = JSON.parse(jsonMatch[0]);
+    res.json({ success: true, extractedData });
+  } catch (err) {
+    console.error('Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== TENANTS =====
+
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
     const { name, personal_email, personal_phone, date_of_move_in } = req.body;
-    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name, personal_email, personal_phone, date_of_move_in, is_active: true }]).select();
+    if (!name || !personal_email) return res.status(400).json({ error: 'Name and email required' });
+    
+    const { data, error } = await supabase.from('tenants').insert([{
+      property_id: req.params.propertyId,
+      user_id: req.userId,
+      name: name.trim(),
+      personal_email: personal_email.trim().toLowerCase(),
+      personal_phone: personal_phone ? personal_phone.trim() : '',
+      date_of_move_in: date_of_move_in || null,
+      is_active: true
+    }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -117,55 +181,15 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   try {
     const { data, error } = await supabase.from('tenants').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId);
     if (error) throw error;
-    res.json(data);
+    res.json(data || []);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/properties/:propertyId/rental-agreements', verifyToken, async (req, res) => {
-  try {
-    const { tenant_id, monthly_rent, security_deposit, agreement_start_date, agreement_end_date } = req.body;
-    const { data, error } = await supabase.from('rental_agreements').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, monthly_rent: parseFloat(monthly_rent), security_deposit: parseFloat(security_deposit || 0), agreement_start_date, agreement_end_date, is_active: true }]).select();
-    if (error) throw error;
-    res.status(201).json(data[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// ===== EXTRACT TENANT FROM AGREEMENT =====
 
-app.get('/api/properties/:propertyId/rental-agreements', verifyToken, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('rental_agreements').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId);
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
-  try {
-    const { tenant_id, amount, payment_date } = req.body;
-    const { data, error } = await supabase.from('payments').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, amount: parseFloat(amount), payment_date }]).select();
-    if (error) throw error;
-    res.status(201).json(data[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('payments').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId);
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), async (req, res) => {
+app.post('/api/extract/tenant', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
@@ -186,30 +210,18 @@ app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), as
     const message = await anthropic.messages.create({
       model: 'claude-opus-4-6',
       max_tokens: 256,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: mimeType,
-                data: base64Data
-              }
-            },
-            {
-              type: 'text',
-              text: prompt
-            }
-          ]
-        }
-      ]
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } },
+          { type: 'text', text: prompt }
+        ]
+      }]
     });
 
     const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return res.status(400).json({ error: 'Could not parse agreement' });
+    if (!jsonMatch) return res.status(400).json({ error: 'Could not extract tenant info' });
 
     const extractedData = JSON.parse(jsonMatch[0]);
     res.json({ success: true, extractedData });
@@ -219,7 +231,144 @@ app.post('/api/extract/rental-agreement', verifyToken, upload.single('file'), as
   }
 });
 
+// ===== DOCUMENT UPLOAD (Deed, Aadhar, PAN) =====
+
+app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    
+    const fileName = `properties/${req.params.propertyId}/deed_${Date.now()}`;
+    const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, {
+      contentType: req.file.mimetype,
+      metadata: { user_id: req.userId }
+    });
+    if (error) throw error;
+    
+    res.json({ success: true, url: fileName });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    if (!['aadhar', 'pan', 'id_proof'].includes(req.params.docType)) return res.status(400).json({ error: 'Invalid doc type' });
+    
+    const fileName = `tenants/${req.params.tenantId}/${req.params.docType}_${Date.now()}`;
+    const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, {
+      contentType: req.file.mimetype,
+      metadata: { user_id: req.userId, tenant_id: req.params.tenantId }
+    });
+    if (error) throw error;
+    
+    res.json({ success: true, url: fileName });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== PAYMENTS =====
+
+app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
+  try {
+    const { tenant_id, amount, payment_date, status } = req.body;
+    if (!tenant_id || !amount) return res.status(400).json({ error: 'Tenant and amount required' });
+    
+    const { data, error } = await supabase.from('payments').insert([{
+      property_id: req.params.propertyId,
+      tenant_id,
+      user_id: req.userId,
+      amount: parseFloat(amount),
+      payment_date: payment_date || new Date().toISOString().split('T')[0],
+      status: status || 'paid'
+    }]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('payments').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).order('payment_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== MAINTENANCE COSTS =====
+
+app.post('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
+  try {
+    const { description, amount, cost_date, paid_by, status } = req.body;
+    if (!description || !amount) return res.status(400).json({ error: 'Description and amount required' });
+    if (!['tenant', 'owner'].includes(paid_by)) return res.status(400).json({ error: 'paid_by must be tenant or owner' });
+    
+    const { data, error } = await supabase.from('maintenance_costs').insert([{
+      property_id: req.params.propertyId,
+      user_id: req.userId,
+      description: description.trim(),
+      amount: parseFloat(amount),
+      cost_date: cost_date || new Date().toISOString().split('T')[0],
+      paid_by: paid_by,
+      status: status || 'pending'
+    }]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('maintenance_costs').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).order('cost_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const { data, error } = await supabase.from('maintenance_costs').update({ status }).eq('id', req.params.maintenanceId).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== DASHBOARD STATS =====
+
+app.get('/api/dashboard', verifyToken, async (req, res) => {
+  try {
+    const { data: props } = await supabase.from('properties').select('id').eq('user_id', req.userId);
+    const { data: tenants } = await supabase.from('tenants').select('id').eq('user_id', req.userId);
+    const { data: payments } = await supabase.from('payments').select('amount').eq('user_id', req.userId).eq('status', 'paid');
+    const { data: maintenance } = await supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending');
+    
+    const totalRentPaid = payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
+    const pendingMaintenance = maintenance?.reduce((sum, m) => sum + (m.amount || 0), 0) || 0;
+    
+    res.json({
+      totalProperties: props?.length || 0,
+      totalTenants: tenants?.length || 0,
+      totalRentPaid,
+      pendingMaintenanceCosts: pendingMaintenance
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }); });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT}`); });
+app.listen(PORT, () => { console.log(`✅ OMniNivas Backend MVP2-Full running on port ${PORT}`); });
