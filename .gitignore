@@ -47,4 +47,4 @@ coverage/\
 \
 \cf2 \strokec2 # Cache\cf4 \strokec4 \
 .cache/\
-.eslintcache}
+.eslintcache}node_modules/
