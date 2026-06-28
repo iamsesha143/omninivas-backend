@@ -8,7 +8,6 @@ const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
 const Anthropic = require('@anthropic-ai/sdk');
-const pdfParse = require('pdf-parse');
 
 const app = express();
 
@@ -43,8 +42,10 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-MultiTenant-PDF', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-Complete', time: new Date().toISOString() });
 });
+
+// ===== AUTH =====
 
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -71,6 +72,8 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ===== PROPERTIES =====
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
@@ -104,67 +107,64 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// Helper function to extract text from PDF
-const extractPdfText = async (buffer) => {
-  try {
-    const data = await pdfParse(buffer);
-    return data.text;
-  } catch (err) {
-    throw new Error('Failed to parse PDF: ' + err.message);
-  }
-};
+// ===== EXTRACT PROPERTY FROM ANY FILE (PDF, Image, Word) =====
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    let prompt, message;
-    const isPdf = req.file.mimetype === 'application/pdf';
+    const base64Data = req.file.buffer.toString('base64');
+    const mimeType = req.file.mimetype || 'application/octet-stream';
 
-    if (isPdf) {
-      // Extract text from PDF
-      const pdfText = await extractPdfText(req.file.buffer);
-      prompt = `Extract property information from this rental agreement or sale deed text. Return ONLY valid JSON:
-{
-  "property_name": "string or null",
-  "street_address": "full address or null",
-  "city": "city name or null",
-  "property_type": "residential/commercial or null"
-}
+    let messageContent = [];
 
-TEXT FROM DOCUMENT:
-${pdfText}`;
-
-      message = await anthropic.messages.create({
-        model: 'claude-opus-4-6',
-        max_tokens: 256,
-        messages: [{ role: 'user', content: prompt }]
-      });
-    } else {
-      // Image processing (existing logic)
-      const base64Data = req.file.buffer.toString('base64');
-      const mimeType = req.file.mimetype || 'image/jpeg';
-
-      prompt = `Extract property information from this sale deed or rental agreement image. Return ONLY valid JSON:
-{
-  "property_name": "string or null",
-  "street_address": "full address or null",
-  "city": "city name or null",
-  "property_type": "residential/commercial or null"
-}`;
-
-      message = await anthropic.messages.create({
-        model: 'claude-opus-4-6',
-        max_tokens: 256,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } },
-            { type: 'text', text: prompt }
-          ]
-        }]
+    // Handle PDF documents
+    if (mimeType === 'application/pdf') {
+      messageContent.push({
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: base64Data
+        }
       });
     }
+    // Handle images
+    else if (mimeType.startsWith('image/')) {
+      messageContent.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: mimeType,
+          data: base64Data
+        }
+      });
+    }
+    // Handle Word documents (.docx)
+    else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || mimeType === 'application/msword') {
+      // Word docs need to be stored, not extracted
+      return res.status(400).json({ error: 'Word documents can be uploaded but not extracted. Please use PDF or image for auto-extraction.' });
+    }
+    else {
+      return res.status(400).json({ error: `Unsupported file type: ${mimeType}. Use PDF, JPG, PNG, or Word.` });
+    }
+
+    messageContent.push({
+      type: 'text',
+      text: `Extract property information from this sale deed or rental agreement. Return ONLY valid JSON:
+{
+  "property_name": "string or null",
+  "street_address": "full address or null",
+  "city": "city name or null",
+  "property_type": "residential/commercial or null"
+}`
+    });
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 256,
+      messages: [{ role: 'user', content: messageContent }]
+    });
 
     const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
@@ -177,6 +177,83 @@ ${pdfText}`;
     res.status(500).json({ error: err.message });
   }
 });
+
+// ===== EXTRACT MULTIPLE TENANTS FROM ANY FILE (PDF, Image, Word) =====
+
+app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+
+    const base64Data = req.file.buffer.toString('base64');
+    const mimeType = req.file.mimetype || 'application/octet-stream';
+
+    let messageContent = [];
+
+    // Handle PDF documents
+    if (mimeType === 'application/pdf') {
+      messageContent.push({
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: base64Data
+        }
+      });
+    }
+    // Handle images
+    else if (mimeType.startsWith('image/')) {
+      messageContent.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: mimeType,
+          data: base64Data
+        }
+      });
+    }
+    // Handle Word documents
+    else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || mimeType === 'application/msword') {
+      return res.status(400).json({ error: 'Word documents can be uploaded but not extracted. Please use PDF or image for auto-extraction.' });
+    }
+    else {
+      return res.status(400).json({ error: `Unsupported file type: ${mimeType}. Use PDF, JPG, PNG, or Word.` });
+    }
+
+    messageContent.push({
+      type: 'text',
+      text: `Extract ALL tenant information from this rental agreement. Return ONLY valid JSON:
+{
+  "tenants": [
+    {
+      "name": "string or null",
+      "personal_email": "string or null",
+      "personal_phone": "string or null",
+      "date_of_move_in": "YYYY-MM-DD or null"
+    }
+  ]
+}
+CRITICAL: Extract ALL tenants listed in the document. Include co-tenants, roommates, everyone.`
+    });
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 512,
+      messages: [{ role: 'user', content: messageContent }]
+    });
+
+    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return res.status(400).json({ error: 'Could not extract tenant info' });
+
+    const extractedData = JSON.parse(jsonMatch[0]);
+    res.json({ success: true, extractedData });
+  } catch (err) {
+    console.error('Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== TENANTS =====
 
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
@@ -221,79 +298,7 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   }
 });
 
-app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file provided' });
-
-    let prompt, message;
-    const isPdf = req.file.mimetype === 'application/pdf';
-
-    if (isPdf) {
-      // Extract text from PDF
-      const pdfText = await extractPdfText(req.file.buffer);
-      prompt = `Extract ALL tenant information from this rental agreement text. Return ONLY valid JSON:
-{
-  "tenants": [
-    {
-      "name": "string or null",
-      "personal_email": "string or null",
-      "personal_phone": "string or null",
-      "date_of_move_in": "YYYY-MM-DD or null"
-    }
-  ]
-}
-Important: Extract ALL tenants listed. Include co-tenants/roommates.
-
-TEXT FROM DOCUMENT:
-${pdfText}`;
-
-      message = await anthropic.messages.create({
-        model: 'claude-opus-4-6',
-        max_tokens: 512,
-        messages: [{ role: 'user', content: prompt }]
-      });
-    } else {
-      // Image processing (existing logic)
-      const base64Data = req.file.buffer.toString('base64');
-      const mimeType = req.file.mimetype || 'image/jpeg';
-
-      prompt = `Extract ALL tenant information from this rental agreement image. Return ONLY valid JSON:
-{
-  "tenants": [
-    {
-      "name": "string or null",
-      "personal_email": "string or null",
-      "personal_phone": "string or null",
-      "date_of_move_in": "YYYY-MM-DD or null"
-    }
-  ]
-}
-Important: Extract ALL tenants listed. Include co-tenants/roommates.`;
-
-      message = await anthropic.messages.create({
-        model: 'claude-opus-4-6',
-        max_tokens: 512,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Data } },
-            { type: 'text', text: prompt }
-          ]
-        }]
-      });
-    }
-
-    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return res.status(400).json({ error: 'Could not extract tenant info' });
-
-    const extractedData = JSON.parse(jsonMatch[0]);
-    res.json({ success: true, extractedData });
-  } catch (err) {
-    console.error('Error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// ===== DOCUMENTS (Store any file type) =====
 
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -320,6 +325,8 @@ app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', ver
   }
 });
 
+// ===== PAYMENTS =====
+
 app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
   try {
     const { tenant_id, amount, payment_date, status } = req.body;
@@ -341,6 +348,8 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
     res.status(500).json({ error: err.message });
   }
 });
+
+// ===== MAINTENANCE COSTS =====
 
 app.post('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
   try {
@@ -375,6 +384,8 @@ app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken,
     res.status(500).json({ error: err.message });
   }
 });
+
+// ===== DASHBOARD STATS =====
 
 app.get('/api/dashboard', verifyToken, async (req, res) => {
   try {
