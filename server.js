@@ -118,21 +118,37 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
 const extractTextFromDocument = async (buffer, mimeType) => {
   if (!visionClient) throw new Error('Google Vision API not configured');
 
-  const request = {
-    image: {
-      content: buffer.toString('base64')
+  try {
+    let result;
+    
+    // Use documentTextDetection for PDFs, textDetection for images
+    if (mimeType === 'application/pdf') {
+      const request = {
+        image: {
+          content: buffer.toString('base64')
+        }
+      };
+      [result] = await visionClient.documentTextDetection(request);
+    } else {
+      const request = {
+        image: {
+          content: buffer.toString('base64')
+        }
+      };
+      [result] = await visionClient.textDetection(request);
     }
-  };
 
-  const [result] = await visionClient.textDetection(request);
-  const detections = result.textAnnotations;
-  
-  if (!detections || detections.length === 0) {
-    return '';
+    const detections = result.textAnnotations;
+    if (!detections || detections.length === 0) {
+      return '';
+    }
+
+    // First element contains all text
+    return detections[0].description || '';
+  } catch (err) {
+    console.error('Vision API error:', err);
+    throw err;
   }
-
-  // First element contains all text
-  return detections[0].description || '';
 };
 
 // ===== EXTRACT PROPERTY DATA =====
@@ -144,13 +160,14 @@ const parsePropertyFromText = (text) => {
   // Try to find city
   let city = null;
   const cityPatterns = [
-    /(?:city|municipality)[\s:]*([A-Za-z\s]+)/i,
-    /(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i
+    /(?:city|municipality|loc|location)[\s:]*([A-Za-z\s]+?)(?:\n|,|india)/i,
+    /(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata|ahmedabad|jaipur)/i
   ];
   for (const pattern of cityPatterns) {
     const match = text.match(pattern);
     if (match) {
-      city = match[1] || match[0];
+      city = match[1] ? match[1].trim() : match[0];
+      if (city.length > 50) city = city.substring(0, 50);
       break;
     }
   }
@@ -158,25 +175,26 @@ const parsePropertyFromText = (text) => {
   // Try to find address
   let address = null;
   const addressPatterns = [
-    /(?:address|location|premises|property)[\s:]*([^\n]+)/i,
-    /(\d+[A-Za-z\s,\-]+(?:road|street|lane|avenue|circle|plot))/i
+    /(?:address|location|premises|property|flat|apt)[\s:]*([^\n]+)/i,
+    /(\d+[A-Za-z\s,\-\.]*(?:road|street|lane|avenue|circle|plot|building|block))/i
   ];
   for (const pattern of addressPatterns) {
     const match = text.match(pattern);
     if (match) {
-      address = match[1] || match[0];
+      address = match[1] ? match[1].trim() : match[0];
+      if (address.length > 100) address = address.substring(0, 100);
       break;
     }
   }
 
   // Try to find property name
-  let propertyName = address || city || 'Property';
+  let propertyName = address ? address.substring(0, 50) : (city ? `${city} Property` : 'Property');
 
   return {
     property_name: propertyName,
     street_address: address || '',
     city: city || '',
-    property_type: textLower.includes('residential') ? 'residential' : 'commercial'
+    property_type: textLower.includes('commercial') ? 'commercial' : 'residential'
   };
 };
 
@@ -186,8 +204,11 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     if (!visionClient) return res.status(503).json({ error: 'Google Vision API not configured' });
 
     const extractedText = await extractTextFromDocument(req.file.buffer, req.file.mimetype);
-    const propertyData = parsePropertyFromText(extractedText);
+    if (!extractedText || extractedText.trim().length === 0) {
+      return res.status(400).json({ error: 'Could not extract text from document. Please ensure file is clear and readable.' });
+    }
 
+    const propertyData = parsePropertyFromText(extractedText);
     res.json({ success: true, extractedData: propertyData, extractedText });
   } catch (err) {
     console.error('Property extraction error:', err);
@@ -195,42 +216,48 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
   }
 });
 
-// ===== EXTRACT TENANTS DATA =====
+// ===== EXTRACT MULTIPLE TENANTS FROM DOCUMENT =====
 
 const parseTenantsFromText = (text) => {
   const tenants = [];
 
   // Email pattern
-  const emailRegex = /[\w\.-]+@[\w\.-]+\.\w+/gi;
-  const emails = text.match(emailRegex) || [];
+  const emailRegex = /[\w\.\-]+@[\w\.\-]+\.\w+/gi;
+  const emails = [...new Set(text.match(emailRegex) || [])];
 
   // Phone patterns (Indian)
   const phoneRegex = /(?:\+91|0)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g;
-  const phones = text.match(phoneRegex) || [];
+  const phones = [...new Set(text.match(phoneRegex) || [])];
 
-  // Name patterns (capitalize words)
-  const nameRegex = /(?:tenant|lessee|party|person|name)[\s:]*([A-Za-z\s]+?)(?:\n|,|email|phone|\d)/gi;
+  // Name patterns - look for names after keywords
+  const nameRegex = /(?:tenant|lessee|party|lessees|person|occupant|occupier|applicant)[\s:]*([A-Z][A-Za-z\s]{2,40}?)(?:\n|,|email|phone|mob|\()/gi;
   const names = [];
   let nameMatch;
   while ((nameMatch = nameRegex.exec(text)) !== null) {
     const name = nameMatch[1].trim();
-    if (name.length > 2 && name.length < 50) {
+    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) {
       names.push(name);
     }
   }
 
-  // Create tenants
-  const maxTenants = Math.max(emails.length, phones.length, names.length, 1);
+  // Remove duplicates
+  const uniqueNames = [...new Set(names)];
+
+  // Create tenants - match emails/phones with names
+  const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
+  
   for (let i = 0; i < maxTenants; i++) {
-    tenants.push({
-      name: names[i] || `Tenant ${i + 1}`,
+    const tenant = {
+      name: uniqueNames[i] || `Tenant ${i + 1}`,
       personal_email: emails[i] || null,
       personal_phone: phones[i] || null,
       date_of_move_in: null
-    });
+    };
+    tenants.push(tenant);
   }
 
-  return tenants.filter(t => t.name && (t.personal_email || t.personal_phone));
+  // Filter: must have name AND (email OR phone)
+  return tenants.filter(t => t.name && t.name !== `Tenant ${tenants.indexOf(t) + 1}` && (t.personal_email || t.personal_phone));
 };
 
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
@@ -239,8 +266,11 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
     if (!visionClient) return res.status(503).json({ error: 'Google Vision API not configured' });
 
     const extractedText = await extractTextFromDocument(req.file.buffer, req.file.mimetype);
-    const tenantsList = parseTenantsFromText(extractedText);
+    if (!extractedText || extractedText.trim().length === 0) {
+      return res.status(400).json({ error: 'Could not extract text from document. Please ensure file is clear and readable.' });
+    }
 
+    const tenantsList = parseTenantsFromText(extractedText);
     res.json({ success: true, extractedData: { tenants: tenantsList }, extractedText });
   } catch (err) {
     console.error('Tenant extraction error:', err);
@@ -293,7 +323,7 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   }
 });
 
-// ===== DOCUMENTS =====
+// ===== DOCUMENTS (Store any file type) =====
 
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
