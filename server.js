@@ -7,7 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
-const Anthropic = require('@anthropic-ai/sdk');
+const vision = require('@google-cloud/vision');
 
 const app = express();
 
@@ -23,9 +23,15 @@ const supabase = createClient(
   { realtime: { transport: ws } }
 );
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY || ''
-});
+// Initialize Google Vision Client
+let visionClient;
+try {
+  const credentials = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS || '{}');
+  visionClient = new vision.ImageAnnotatorClient({ credentials });
+} catch (err) {
+  console.warn('⚠️  Google Vision not configured. Text extraction will be disabled.');
+  visionClient = null;
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
 
@@ -42,7 +48,7 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-Complete', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-GoogleVision', time: new Date().toISOString(), googleVisionReady: !!visionClient });
 });
 
 // ===== AUTH =====
@@ -107,149 +113,138 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== EXTRACT PROPERTY FROM ANY FILE (PDF, Image, Word) =====
+// ===== GOOGLE VISION TEXT EXTRACTION =====
+
+const extractTextFromDocument = async (buffer, mimeType) => {
+  if (!visionClient) throw new Error('Google Vision API not configured');
+
+  const request = {
+    image: {
+      content: buffer.toString('base64')
+    }
+  };
+
+  const [result] = await visionClient.textDetection(request);
+  const detections = result.textAnnotations;
+  
+  if (!detections || detections.length === 0) {
+    return '';
+  }
+
+  // First element contains all text
+  return detections[0].description || '';
+};
+
+// ===== EXTRACT PROPERTY DATA =====
+
+const parsePropertyFromText = (text) => {
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const textLower = text.toLowerCase();
+
+  // Try to find city
+  let city = null;
+  const cityPatterns = [
+    /(?:city|municipality)[\s:]*([A-Za-z\s]+)/i,
+    /(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i
+  ];
+  for (const pattern of cityPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      city = match[1] || match[0];
+      break;
+    }
+  }
+
+  // Try to find address
+  let address = null;
+  const addressPatterns = [
+    /(?:address|location|premises|property)[\s:]*([^\n]+)/i,
+    /(\d+[A-Za-z\s,\-]+(?:road|street|lane|avenue|circle|plot))/i
+  ];
+  for (const pattern of addressPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      address = match[1] || match[0];
+      break;
+    }
+  }
+
+  // Try to find property name
+  let propertyName = address || city || 'Property';
+
+  return {
+    property_name: propertyName,
+    street_address: address || '',
+    city: city || '',
+    property_type: textLower.includes('residential') ? 'residential' : 'commercial'
+  };
+};
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    if (!visionClient) return res.status(503).json({ error: 'Google Vision API not configured' });
 
-    const base64Data = req.file.buffer.toString('base64');
-    const mimeType = req.file.mimetype || 'application/octet-stream';
+    const extractedText = await extractTextFromDocument(req.file.buffer, req.file.mimetype);
+    const propertyData = parsePropertyFromText(extractedText);
 
-    let messageContent = [];
-
-    // Handle PDF documents
-    if (mimeType === 'application/pdf') {
-      messageContent.push({
-        type: 'document',
-        source: {
-          type: 'base64',
-          media_type: 'application/pdf',
-          data: base64Data
-        }
-      });
-    }
-    // Handle images
-    else if (mimeType.startsWith('image/')) {
-      messageContent.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: mimeType,
-          data: base64Data
-        }
-      });
-    }
-    // Handle Word documents (.docx)
-    else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || mimeType === 'application/msword') {
-      // Word docs need to be stored, not extracted
-      return res.status(400).json({ error: 'Word documents can be uploaded but not extracted. Please use PDF or image for auto-extraction.' });
-    }
-    else {
-      return res.status(400).json({ error: `Unsupported file type: ${mimeType}. Use PDF, JPG, PNG, or Word.` });
-    }
-
-    messageContent.push({
-      type: 'text',
-      text: `Extract property information from this sale deed or rental agreement. Return ONLY valid JSON:
-{
-  "property_name": "string or null",
-  "street_address": "full address or null",
-  "city": "city name or null",
-  "property_type": "residential/commercial or null"
-}`
-    });
-
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 256,
-      messages: [{ role: 'user', content: messageContent }]
-    });
-
-    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return res.status(400).json({ error: 'Could not extract property info' });
-
-    const extractedData = JSON.parse(jsonMatch[0]);
-    res.json({ success: true, extractedData });
+    res.json({ success: true, extractedData: propertyData, extractedText });
   } catch (err) {
-    console.error('Error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Property extraction error:', err);
+    res.status(500).json({ error: 'Failed to extract property data: ' + err.message });
   }
 });
 
-// ===== EXTRACT MULTIPLE TENANTS FROM ANY FILE (PDF, Image, Word) =====
+// ===== EXTRACT TENANTS DATA =====
+
+const parseTenantsFromText = (text) => {
+  const tenants = [];
+
+  // Email pattern
+  const emailRegex = /[\w\.-]+@[\w\.-]+\.\w+/gi;
+  const emails = text.match(emailRegex) || [];
+
+  // Phone patterns (Indian)
+  const phoneRegex = /(?:\+91|0)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g;
+  const phones = text.match(phoneRegex) || [];
+
+  // Name patterns (capitalize words)
+  const nameRegex = /(?:tenant|lessee|party|person|name)[\s:]*([A-Za-z\s]+?)(?:\n|,|email|phone|\d)/gi;
+  const names = [];
+  let nameMatch;
+  while ((nameMatch = nameRegex.exec(text)) !== null) {
+    const name = nameMatch[1].trim();
+    if (name.length > 2 && name.length < 50) {
+      names.push(name);
+    }
+  }
+
+  // Create tenants
+  const maxTenants = Math.max(emails.length, phones.length, names.length, 1);
+  for (let i = 0; i < maxTenants; i++) {
+    tenants.push({
+      name: names[i] || `Tenant ${i + 1}`,
+      personal_email: emails[i] || null,
+      personal_phone: phones[i] || null,
+      date_of_move_in: null
+    });
+  }
+
+  return tenants.filter(t => t.name && (t.personal_email || t.personal_phone));
+};
 
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    if (!visionClient) return res.status(503).json({ error: 'Google Vision API not configured' });
 
-    const base64Data = req.file.buffer.toString('base64');
-    const mimeType = req.file.mimetype || 'application/octet-stream';
+    const extractedText = await extractTextFromDocument(req.file.buffer, req.file.mimetype);
+    const tenantsList = parseTenantsFromText(extractedText);
 
-    let messageContent = [];
-
-    // Handle PDF documents
-    if (mimeType === 'application/pdf') {
-      messageContent.push({
-        type: 'document',
-        source: {
-          type: 'base64',
-          media_type: 'application/pdf',
-          data: base64Data
-        }
-      });
-    }
-    // Handle images
-    else if (mimeType.startsWith('image/')) {
-      messageContent.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: mimeType,
-          data: base64Data
-        }
-      });
-    }
-    // Handle Word documents
-    else if (mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || mimeType === 'application/msword') {
-      return res.status(400).json({ error: 'Word documents can be uploaded but not extracted. Please use PDF or image for auto-extraction.' });
-    }
-    else {
-      return res.status(400).json({ error: `Unsupported file type: ${mimeType}. Use PDF, JPG, PNG, or Word.` });
-    }
-
-    messageContent.push({
-      type: 'text',
-      text: `Extract ALL tenant information from this rental agreement. Return ONLY valid JSON:
-{
-  "tenants": [
-    {
-      "name": "string or null",
-      "personal_email": "string or null",
-      "personal_phone": "string or null",
-      "date_of_move_in": "YYYY-MM-DD or null"
-    }
-  ]
-}
-CRITICAL: Extract ALL tenants listed in the document. Include co-tenants, roommates, everyone.`
-    });
-
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 512,
-      messages: [{ role: 'user', content: messageContent }]
-    });
-
-    const responseText = message.content[0].type === 'text' ? message.content[0].text : '';
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return res.status(400).json({ error: 'Could not extract tenant info' });
-
-    const extractedData = JSON.parse(jsonMatch[0]);
-    res.json({ success: true, extractedData });
+    res.json({ success: true, extractedData: { tenants: tenantsList }, extractedText });
   } catch (err) {
-    console.error('Error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Tenant extraction error:', err);
+    res.status(500).json({ error: 'Failed to extract tenant data: ' + err.message });
   }
 });
 
@@ -298,7 +293,7 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   }
 });
 
-// ===== DOCUMENTS (Store any file type) =====
+// ===== DOCUMENTS =====
 
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -409,4 +404,4 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }); });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT}`); });
+app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT} with Google Vision enabled`); });
