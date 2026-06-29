@@ -33,7 +33,6 @@
     "pako": "^3.0.0",
     "pdf-image": "^2.0.0",
     "pdf-parse": "^2.4.5",
-    "pdfjs-dist": "^6.1.200",
     "sharp": "^0.35.2",
     "tesseract.js": "^7.0.0",
     "ws": "^8.21.0"

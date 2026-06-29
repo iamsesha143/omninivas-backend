@@ -8,8 +8,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
 const vision = require('@google-cloud/vision');
-const pdfjsLib = require('pdfjs-dist');
-const { Canvas, Image } = require('canvas');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 
@@ -25,13 +24,12 @@ const supabase = createClient(
   { realtime: { transport: ws } }
 );
 
-// Initialize Google Vision Client
 let visionClient;
 try {
   const credentials = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS || '{}');
   visionClient = new vision.ImageAnnotatorClient({ credentials });
 } catch (err) {
-  console.warn('⚠️  Google Vision not configured. Text extraction will be disabled.');
+  console.warn('⚠️  Google Vision not configured.');
   visionClient = null;
 }
 
@@ -50,7 +48,7 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-PDFRendering', time: new Date().toISOString(), googleVisionReady: !!visionClient });
+  res.json({ status: 'ok', version: 'MVP2-Complete', time: new Date().toISOString() });
 });
 
 // ===== AUTH =====
@@ -115,103 +113,57 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== PDF TO IMAGE CONVERSION =====
+// ===== EXTRACT TEXT FROM PDF/IMAGE =====
 
-const renderPdfPageAsImage = async (buffer) => {
-  try {
-    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
-    const page = await pdf.getPage(1); // Get first page
-    
-    const viewport = page.getViewport({ scale: 2 });
-    const canvas = new Canvas(viewport.width, viewport.height);
-    const ctx = canvas.getContext('2d');
+const extractTextFromFile = async (buffer, mimeType) => {
+  let text = '';
 
-    await page.render({
-      canvasContext: ctx,
-      viewport: viewport
-    }).promise;
-
-    return canvas.toBuffer('image/png');
-  } catch (err) {
-    console.error('PDF rendering error:', err);
-    throw new Error('Failed to render PDF. File may be corrupted.');
-  }
-};
-
-// ===== GOOGLE VISION TEXT EXTRACTION =====
-
-const extractTextFromDocument = async (buffer, mimeType) => {
-  if (!visionClient) throw new Error('Google Vision API not configured');
-
-  try {
-    let imageBuffer = buffer;
-
-    // If PDF, render first page as image
-    if (mimeType === 'application/pdf') {
-      imageBuffer = await renderPdfPageAsImage(buffer);
+  // Try PDF extraction first
+  if (mimeType === 'application/pdf') {
+    try {
+      const data = await pdfParse(buffer);
+      text = data.text || '';
+    } catch (err) {
+      console.warn('PDF parse failed, trying Vision API');
     }
+  }
 
-    const request = {
-      image: {
-        content: imageBuffer.toString('base64')
+  // If no text or image file, use Google Vision
+  if (!text && visionClient) {
+    try {
+      const request = { image: { content: buffer.toString('base64') } };
+      const [result] = await visionClient.textDetection(request);
+      const detections = result.textAnnotations;
+      if (detections && detections.length > 0) {
+        text = detections[0].description || '';
       }
-    };
-
-    const [result] = await visionClient.textDetection(request);
-    const detections = result.textAnnotations;
-    
-    if (!detections || detections.length === 0) {
-      return '';
+    } catch (err) {
+      console.error('Vision API error:', err);
     }
-
-    return detections[0].description || '';
-  } catch (err) {
-    console.error('Vision API error:', err);
-    throw err;
   }
+
+  return text;
 };
 
-// ===== PARSE PROPERTY FROM TEXT =====
+// ===== PARSE PROPERTY =====
 
 const parsePropertyFromText = (text) => {
   const textLower = text.toLowerCase();
+  let city = '', address = '', propertyName = 'Property';
 
-  // Try to find city
-  let city = null;
-  const cityPatterns = [
-    /(?:city|municipality|loc|location)[\s:]*([A-Za-z\s]+?)(?:\n|,|india)/i,
-    /(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata|ahmedabad|jaipur)/i
-  ];
-  for (const pattern of cityPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      city = match[1] ? match[1].trim() : match[0];
-      if (city.length > 50) city = city.substring(0, 50);
-      break;
-    }
-  }
+  const cityMatch = text.match(/(?:city|location)[\s:]*([A-Za-z\s]+?)(?:\n|,|india)/i);
+  if (cityMatch) city = cityMatch[1].trim().substring(0, 50);
 
-  // Try to find address
-  let address = null;
-  const addressPatterns = [
-    /(?:address|location|premises|property|flat|apt)[\s:]*([^\n]+)/i,
-    /(\d+[A-Za-z\s,\-\.]*(?:road|street|lane|avenue|circle|plot|building|block))/i
-  ];
-  for (const pattern of addressPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      address = match[1] ? match[1].trim() : match[0];
-      if (address.length > 100) address = address.substring(0, 100);
-      break;
-    }
-  }
+  const addressMatch = text.match(/(?:address|location|premises|property)[\s:]*([^\n]+)/i);
+  if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
 
-  let propertyName = address ? address.substring(0, 50) : (city ? `${city} Property` : 'Property');
+  if (address) propertyName = address.substring(0, 50);
+  else if (city) propertyName = `${city} Property`;
 
   return {
     property_name: propertyName,
-    street_address: address || '',
-    city: city || '',
+    street_address: address,
+    city: city,
     property_type: textLower.includes('commercial') ? 'commercial' : 'residential'
   };
 };
@@ -219,45 +171,38 @@ const parsePropertyFromText = (text) => {
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    if (!visionClient) return res.status(503).json({ error: 'Google Vision API not configured' });
 
-    const extractedText = await extractTextFromDocument(req.file.buffer, req.file.mimetype);
-    if (!extractedText || extractedText.trim().length === 0) {
-      return res.status(400).json({ error: 'Could not extract text from document. Please ensure file is clear and readable.' });
+    const text = await extractTextFromFile(req.file.buffer, req.file.mimetype);
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: 'Could not extract text. Try a clearer image or PDF.' });
     }
 
-    const propertyData = parsePropertyFromText(extractedText);
-    res.json({ success: true, extractedData: propertyData, extractedText });
+    const propertyData = parsePropertyFromText(text);
+    res.json({ success: true, extractedData: propertyData, extractedText: text });
   } catch (err) {
     console.error('Property extraction error:', err);
     res.status(500).json({ error: 'Failed to extract property data: ' + err.message });
   }
 });
 
-// ===== PARSE TENANTS FROM TEXT =====
+// ===== PARSE TENANTS =====
 
 const parseTenantsFromText = (text) => {
-  const tenants = [];
+  const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
+  const phones = [...new Set(text.match(/(?:\+91|0)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
 
-  const emailRegex = /[\w\.\-]+@[\w\.\-]+\.\w+/gi;
-  const emails = [...new Set(text.match(emailRegex) || [])];
-
-  const phoneRegex = /(?:\+91|0)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g;
-  const phones = [...new Set(text.match(phoneRegex) || [])];
-
-  const nameRegex = /(?:tenant|lessee|party|lessees|person|occupant|occupier|applicant|name)[\s:]*([A-Z][A-Za-z\s]{2,40}?)(?:\n|,|email|phone|mob|\()/gi;
+  const nameRegex = /(?:tenant|lessee|party|person|name)[\s:]*([A-Z][A-Za-z\s]{2,40}?)(?:\n|,|email|phone)/gi;
   const names = [];
-  let nameMatch;
-  while ((nameMatch = nameRegex.exec(text)) !== null) {
-    const name = nameMatch[1].trim();
-    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) {
-      names.push(name);
-    }
+  let match;
+  while ((match = nameRegex.exec(text)) !== null) {
+    const name = match[1].trim();
+    if (name.length > 2 && name.length < 50) names.push(name);
   }
 
   const uniqueNames = [...new Set(names)];
   const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
-  
+  const tenants = [];
+
   for (let i = 0; i < maxTenants; i++) {
     const tenant = {
       name: uniqueNames[i] || `Tenant ${i + 1}`,
@@ -268,21 +213,20 @@ const parseTenantsFromText = (text) => {
     tenants.push(tenant);
   }
 
-  return tenants.filter(t => t.name && t.name !== `Tenant ${tenants.indexOf(t) + 1}` && (t.personal_email || t.personal_phone));
+  return tenants.filter(t => t.name && (t.personal_email || t.personal_phone));
 };
 
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    if (!visionClient) return res.status(503).json({ error: 'Google Vision API not configured' });
 
-    const extractedText = await extractTextFromDocument(req.file.buffer, req.file.mimetype);
-    if (!extractedText || extractedText.trim().length === 0) {
-      return res.status(400).json({ error: 'Could not extract text from document. Please ensure file is clear and readable.' });
+    const text = await extractTextFromFile(req.file.buffer, req.file.mimetype);
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: 'Could not extract text. Try a clearer image or PDF.' });
     }
 
-    const tenantsList = parseTenantsFromText(extractedText);
-    res.json({ success: true, extractedData: { tenants: tenantsList }, extractedText });
+    const tenantsList = parseTenantsFromText(text);
+    res.json({ success: true, extractedData: { tenants: tenantsList }, extractedText: text });
   } catch (err) {
     console.error('Tenant extraction error:', err);
     res.status(500).json({ error: 'Failed to extract tenant data: ' + err.message });
@@ -385,7 +329,7 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
   }
 });
 
-// ===== MAINTENANCE COSTS =====
+// ===== MAINTENANCE =====
 
 app.post('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
   try {
@@ -445,4 +389,4 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }); });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT} with PDF rendering enabled`); });
+app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT}`); });
