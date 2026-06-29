@@ -7,11 +7,10 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
-const pdfParse = require('pdf-parse');
 
 const app = express();
 
-// CORS - MUST be before routes
+// CORS
 app.use(cors({
   origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000'],
   credentials: true,
@@ -45,7 +44,7 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-PDFSimple', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-Production', time: new Date().toISOString() });
 });
 
 // ===== AUTH =====
@@ -110,21 +109,39 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== TEXT EXTRACTION =====
+// ===== TEXT EXTRACTION FROM PDF =====
 
-const extractTextFromPDF = async (buffer) => {
-  const data = await pdfParse(buffer);
-  return data.text || '';
+const extractTextFromPDF = (buffer) => {
+  try {
+    const text = buffer.toString('latin1');
+    const matches = text.match(/BT[\s\S]*?ET/g) || [];
+    let extracted = '';
+    
+    matches.forEach(match => {
+      const strMatches = match.match(/\((.*?)\)/g) || [];
+      strMatches.forEach(str => {
+        extracted += str.replace(/[()]/g, '').replace(/\\/g, '') + ' ';
+      });
+    });
+    
+    if (!extracted) {
+      extracted = text.replace(/[^\x20-\x7E\n\r]/g, '').slice(0, 5000);
+    }
+    
+    return extracted || '';
+  } catch (err) {
+    return '';
+  }
 };
 
 const parsePropertyFromText = (text) => {
   const textLower = text.toLowerCase();
   let city = '', address = '', propertyName = 'Property';
 
-  const cityMatch = text.match(/(?:city|location|bangalore|bengaluru|mumbai|delhi|pune|hyderabad|flat|wing)[\s:]*([A-Za-z\s,\-\d]+?)(?:\n|,|\d{6})/i);
-  if (cityMatch) city = cityMatch[1].trim().substring(0, 50).replace(/\d{6}/, '');
+  const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
+  if (cityMatch) city = cityMatch[0];
 
-  const addressMatch = text.match(/(?:flat|wing|address|road|main road|sentosa|panathur)[\s\#]*[\d\w\s,\-\.]*(?:bengaluru|bangalore)?/i);
+  const addressMatch = text.match(/(?:flat|wing|address)[\s\#]*[\d\w\s,\-\.]+(?:bengaluru|bangalore)?/i);
   if (addressMatch) address = addressMatch[0].trim().substring(0, 100);
 
   if (address) propertyName = address.substring(0, 50);
@@ -142,19 +159,14 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    let text = '';
-    if (req.file.mimetype === 'application/pdf') {
-      text = await extractTextFromPDF(req.file.buffer);
-    }
-
-    if (!text || text.trim().length === 0) {
+    const text = extractTextFromPDF(req.file.buffer);
+    if (!text || text.trim().length < 50) {
       return res.status(400).json({ error: 'Could not extract text from file' });
     }
 
     const propertyData = parsePropertyFromText(text);
     res.json({ success: true, extractedData: propertyData });
   } catch (err) {
-    console.error('Property extraction error:', err);
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
 });
@@ -165,14 +177,12 @@ const parseTenantsFromText = (text) => {
   const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
   const phones = [...new Set(text.match(/(?:\+91)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
 
-  const nameRegex = /(?:tenant|lessee|shreya|shraddha|name|second party|lessor)[\s:]*([A-Z][A-Za-z\s]{2,50}?)(?:\n|aadhar|id|email|phone|d\/o|permanently)/gi;
+  const nameRegex = /(?:tenant|lessee|shreya|shraddha|name|second party)[\s:]*([A-Z][A-Za-z\s]{2,50}?)(?:\n|aadhar|id|email|phone|d\/o)/gi;
   const names = [];
   let match;
   while ((match = nameRegex.exec(text)) !== null) {
-    const name = match[1].trim().replace(/aadhar|id|email|phone/gi, '');
-    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) {
-      names.push(name);
-    }
+    const name = match[1].trim();
+    if (name.length > 2 && name.length < 50) names.push(name);
   }
 
   const uniqueNames = [...new Set(names)];
@@ -195,19 +205,14 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    let text = '';
-    if (req.file.mimetype === 'application/pdf') {
-      text = await extractTextFromPDF(req.file.buffer);
-    }
-
-    if (!text || text.trim().length === 0) {
+    const text = extractTextFromPDF(req.file.buffer);
+    if (!text || text.trim().length < 50) {
       return res.status(400).json({ error: 'Could not extract text from file' });
     }
 
     const tenantsList = parseTenantsFromText(text);
     res.json({ success: true, extractedData: { tenants: tenantsList } });
   } catch (err) {
-    console.error('Tenant extraction error:', err);
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
 });
