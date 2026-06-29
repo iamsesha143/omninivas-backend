@@ -1,5 +1,4 @@
 export type EventBus = import("./event_utils").EventBus;
-export type IPDFLinkService = import("./interfaces").IPDFLinkService;
 export type PDFLinkServiceOptions = {
     /**
      * - The application event bus.
@@ -45,9 +44,8 @@ export namespace LinkTarget {
 /**
  * Performs navigation functions inside PDF, such as opening specified page,
  * or destination.
- * @implements {IPDFLinkService}
  */
-export class PDFLinkService implements IPDFLinkService {
+export class PDFLinkService {
     /**
      * @param {PDFLinkServiceOptions} options
      */
@@ -109,6 +107,13 @@ export class PDFLinkService implements IPDFLinkService {
      */
     goToXY(pageNumber: number, x: number, y: number, options?: Object): void;
     /**
+     * @param {string} id
+     *   Unique attachment identifier (required).
+     * @returns {Promise<CatalogAttachmentContent>}
+     *   Content.
+     */
+    getAttachmentContent(id: string): Promise<CatalogAttachmentContent>;
+    /**
      * Adds various attributes (href, title, target, rel) to hyperlinks.
      * @param {HTMLAnchorElement} link
      * @param {string} url
@@ -140,8 +145,6 @@ export class PDFLinkService implements IPDFLinkService {
      */
     executeSetOCGState(action: Object): Promise<void>;
 }
-/**
- * @implements {IPDFLinkService}
- */
-export class SimpleLinkService extends PDFLinkService implements IPDFLinkService {
+export class SimpleLinkService extends PDFLinkService {
 }
+import type { CatalogAttachmentContent } from "../src/core/catalog.js";
