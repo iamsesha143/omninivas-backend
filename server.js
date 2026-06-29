@@ -7,10 +7,11 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
+const client = new Anthropic();
 
-// CORS
 app.use(cors({
   origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000'],
   credentials: true,
@@ -44,10 +45,8 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-Production', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-Claude-Fixed', time: new Date().toISOString() });
 });
-
-// ===== AUTH =====
 
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -74,8 +73,6 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ===== PROPERTIES =====
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
@@ -109,109 +106,97 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== TEXT EXTRACTION FROM PDF =====
-
-const extractTextFromPDF = (buffer) => {
-  try {
-    const text = buffer.toString('latin1');
-    const matches = text.match(/BT[\s\S]*?ET/g) || [];
-    let extracted = '';
-    
-    matches.forEach(match => {
-      const strMatches = match.match(/\((.*?)\)/g) || [];
-      strMatches.forEach(str => {
-        extracted += str.replace(/[()]/g, '').replace(/\\/g, '') + ' ';
-      });
-    });
-    
-    if (!extracted) {
-      extracted = text.replace(/[^\x20-\x7E\n\r]/g, '').slice(0, 5000);
-    }
-    
-    return extracted || '';
-  } catch (err) {
-    return '';
-  }
-};
-
-const parsePropertyFromText = (text) => {
-  const textLower = text.toLowerCase();
-  let city = '', address = '', propertyName = 'Property';
-
-  const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
-  if (cityMatch) city = cityMatch[0];
-
-  const addressMatch = text.match(/(?:flat|wing|address)[\s\#]*[\d\w\s,\-\.]+(?:bengaluru|bangalore)?/i);
-  if (addressMatch) address = addressMatch[0].trim().substring(0, 100);
-
-  if (address) propertyName = address.substring(0, 50);
-  else if (city) propertyName = `${city} Property`;
-
-  return {
-    property_name: propertyName,
-    street_address: address,
-    city: city || 'Bengaluru',
-    property_type: textLower.includes('commercial') ? 'commercial' : 'residential'
-  };
-};
+// ===== IMPROVED EXTRACTION WITH CLAUDE =====
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    const text = extractTextFromPDF(req.file.buffer);
-    if (!text || text.trim().length < 50) {
-      return res.status(400).json({ error: 'Could not extract text from file' });
-    }
+    const base64 = req.file.buffer.toString('base64');
+    const mediaType = req.file.mimetype === 'application/pdf' ? 'application/pdf' : 'image/jpeg';
 
-    const propertyData = parsePropertyFromText(text);
-    res.json({ success: true, extractedData: propertyData });
+    const response = await client.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 500,
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'document',
+          source: { type: 'base64', media_type: mediaType, data: base64 }
+        }, {
+          type: 'text',
+          text: `Extract ONLY the property details from this rental agreement. Look for: property name/flat number/wing, street address, and city/location.
+
+CRITICAL RULES:
+1. property_name: The ACTUAL flat/unit number + building name. NOT generic. Examples: "Flat 4162, Sobha Sentosa", "Unit 45305, Prestige Lavender Fields"
+2. street_address: The full physical address with street name and area
+3. city: The city name (Bengaluru, Mumbai, etc)
+4. property_type: "residential" or "commercial"
+
+Return ONLY valid JSON - no other text:
+{
+  "property_name": "string",
+  "street_address": "string",
+  "city": "string",
+  "property_type": "string"
+}`
+        }]
+      }]
+    });
+
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    const parsed = JSON.parse(text);
+
+    res.json({ success: true, extractedData: parsed });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
 });
 
-// ===== PARSE TENANTS =====
-
-const parseTenantsFromText = (text) => {
-  const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
-  const phones = [...new Set(text.match(/(?:\+91)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
-
-  const nameRegex = /(?:tenant|lessee|shreya|shraddha|name|second party)[\s:]*([A-Z][A-Za-z\s]{2,50}?)(?:\n|aadhar|id|email|phone|d\/o)/gi;
-  const names = [];
-  let match;
-  while ((match = nameRegex.exec(text)) !== null) {
-    const name = match[1].trim();
-    if (name.length > 2 && name.length < 50) names.push(name);
-  }
-
-  const uniqueNames = [...new Set(names)];
-  const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
-  const tenants = [];
-
-  for (let i = 0; i < maxTenants; i++) {
-    tenants.push({
-      name: uniqueNames[i] || `Tenant ${i + 1}`,
-      personal_email: emails[i] || null,
-      personal_phone: phones[i] || null,
-      date_of_move_in: null
-    });
-  }
-
-  return tenants.filter(t => t.name && (t.personal_email || t.personal_phone));
-};
-
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
 
-    const text = extractTextFromPDF(req.file.buffer);
-    if (!text || text.trim().length < 50) {
-      return res.status(400).json({ error: 'Could not extract text from file' });
-    }
+    const base64 = req.file.buffer.toString('base64');
+    const mediaType = req.file.mimetype === 'application/pdf' ? 'application/pdf' : 'image/jpeg';
 
-    const tenantsList = parseTenantsFromText(text);
-    res.json({ success: true, extractedData: { tenants: tenantsList } });
+    const response = await client.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'document',
+          source: { type: 'base64', media_type: mediaType, data: base64 }
+        }, {
+          type: 'text',
+          text: `Extract ALL tenant/lessee information from this rental agreement. Look for the section labeled "tenant", "lessee", "second party", or similar.
+
+CRITICAL RULES:
+1. Find every person listed as a tenant/lessee
+2. Extract their FULL NAME (not abbreviated, all caps if written that way)
+3. Extract email address if present
+4. Extract phone number if present (may be in different formats)
+5. Extract move-in date if present
+6. If information is missing, use null
+
+Return ONLY a JSON array - no other text:
+[
+  {
+    "name": "string (FULL NAME)",
+    "personal_email": "string or null",
+    "personal_phone": "string or null",
+    "date_of_move_in": "YYYY-MM-DD or null"
+  }
+]`
+        }]
+      }]
+    });
+
+    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    const tenants = JSON.parse(text);
+
+    res.json({ success: true, extractedData: { tenants } });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
