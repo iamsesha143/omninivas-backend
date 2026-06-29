@@ -11,7 +11,14 @@ const pdfParse = require('pdf-parse');
 
 const app = express();
 
-app.use(cors());
+// CORS - MUST be before routes
+app.use(cors({
+  origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb' }));
 
