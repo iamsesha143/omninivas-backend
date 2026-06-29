@@ -1,44 +1,25 @@
 {
   "name": "omninivas-backend",
   "version": "1.0.0",
-  "description": "OMniNivas - Multi-property landlord SaaS backend",
+  "description": "OMniNivas Backend",
   "main": "server.js",
+  "engines": {
+    "node": "20.x"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js",
-    "build": "echo 'No build step required'",
-    "test": "jest"
+    "dev": "nodemon server.js"
   },
-  "keywords": [
-    "landlord",
-    "property",
-    "saas",
-    "mortgages",
-    "tenants"
-  ],
-  "author": "Your Name",
-  "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.106.0",
-    "@google-cloud/vision": "^5.3.7",
-    "@supabase/supabase-js": "^2.29.0",
+    "@google-cloud/vision": "^4.3.0",
+    "@supabase/supabase-js": "^2.39.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
-    "crypto": "^1.0.1",
-    "dotenv": "^16.0.3",
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "jsonwebtoken": "^9.0.0",
-    "multer": "^2.2.0",
-    "pdf-image": "^2.0.0",
+    "jsonwebtoken": "^9.1.2",
+    "multer": "^1.4.5-lts.1",
     "pdf-parse": "^2.4.5",
-    "sharp": "^0.35.2",
     "ws": "^8.21.0"
-  },
-  "devDependencies": {
-    "jest": "^29.5.0",
-    "nodemon": "^2.0.22"
-  },
-  "engines": {
-    "node": "18.x"
   }
 }
