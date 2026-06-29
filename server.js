@@ -28,8 +28,9 @@ let visionClient;
 try {
   const credentials = JSON.parse(process.env.GOOGLE_CLOUD_CREDENTIALS || '{}');
   visionClient = new vision.ImageAnnotatorClient({ credentials });
+  console.log('✅ Google Vision API initialized');
 } catch (err) {
-  console.warn('⚠️  Google Vision not configured.');
+  console.warn('⚠️  Google Vision not configured');
   visionClient = null;
 }
 
@@ -48,7 +49,7 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-Complete', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-PDFComplete', time: new Date().toISOString() });
 });
 
 // ===== AUTH =====
@@ -113,36 +114,56 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== EXTRACT TEXT FROM PDF/IMAGE =====
+// ===== TEXT EXTRACTION (PDF + Image) =====
 
 const extractTextFromFile = async (buffer, mimeType) => {
-  let text = '';
-
-  // Try PDF extraction first
+  // Path 1: Try pdf-parse for searchable PDFs (instant)
   if (mimeType === 'application/pdf') {
     try {
       const data = await pdfParse(buffer);
-      text = data.text || '';
-    } catch (err) {
-      console.warn('PDF parse failed, trying Vision API');
-    }
-  }
-
-  // If no text or image file, use Google Vision
-  if (!text && visionClient) {
-    try {
-      const request = { image: { content: buffer.toString('base64') } };
-      const [result] = await visionClient.textDetection(request);
-      const detections = result.textAnnotations;
-      if (detections && detections.length > 0) {
-        text = detections[0].description || '';
+      if (data.text && data.text.trim().length > 50) {
+        console.log('✅ Extracted from searchable PDF via pdf-parse');
+        return data.text;
       }
     } catch (err) {
-      console.error('Vision API error:', err);
+      console.log('📋 Searchable PDF failed, trying Vision API...');
     }
   }
 
-  return text;
+  // Path 2: Google Vision asyncBatchAnnotateFiles (handles scanned PDFs + images)
+  if (!visionClient) throw new Error('Google Vision API not configured');
+
+  try {
+    const request = {
+      requests: [{
+        inputContent: buffer,
+        features: [{ type: 'TEXT_DETECTION' }],
+        mimeType: mimeType || 'image/jpeg'
+      }]
+    };
+
+    console.log('📤 Sending to Google Vision (asyncBatchAnnotateFiles)...');
+    const [operation] = await visionClient.asyncBatchAnnotateFiles(request);
+    
+    console.log('⏳ Waiting for Vision API response...');
+    const [filesResponse] = await operation.promise();
+
+    if (filesResponse && filesResponse.responses && filesResponse.responses[0]) {
+      const response = filesResponse.responses[0];
+      if (response.textAnnotations && response.textAnnotations.length > 0) {
+        const text = response.textAnnotations[0].description || '';
+        if (text.trim().length > 0) {
+          console.log('✅ Extracted from Vision API');
+          return text;
+        }
+      }
+    }
+
+    throw new Error('Vision API returned no text annotations');
+  } catch (err) {
+    console.error('Text extraction error:', err);
+    throw new Error(`Failed to extract text: ${err.message}`);
+  }
 };
 
 // ===== PARSE PROPERTY =====
@@ -151,10 +172,10 @@ const parsePropertyFromText = (text) => {
   const textLower = text.toLowerCase();
   let city = '', address = '', propertyName = 'Property';
 
-  const cityMatch = text.match(/(?:city|location)[\s:]*([A-Za-z\s]+?)(?:\n|,|india)/i);
+  const cityMatch = text.match(/(?:city|location|municipality)[\s:]*([A-Za-z\s]+?)(?:\n|,|india)/i);
   if (cityMatch) city = cityMatch[1].trim().substring(0, 50);
 
-  const addressMatch = text.match(/(?:address|location|premises|property)[\s:]*([^\n]+)/i);
+  const addressMatch = text.match(/(?:address|location|premises|property|flat|apt)[\s:]*([^\n]+)/i);
   if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
 
   if (address) propertyName = address.substring(0, 50);
@@ -174,14 +195,14 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
 
     const text = await extractTextFromFile(req.file.buffer, req.file.mimetype);
     if (!text || text.trim().length === 0) {
-      return res.status(400).json({ error: 'Could not extract text. Try a clearer image or PDF.' });
+      return res.status(400).json({ error: 'Could not extract text from file. Ensure image/PDF is clear.' });
     }
 
     const propertyData = parsePropertyFromText(text);
-    res.json({ success: true, extractedData: propertyData, extractedText: text });
+    res.json({ success: true, extractedData: propertyData });
   } catch (err) {
     console.error('Property extraction error:', err);
-    res.status(500).json({ error: 'Failed to extract property data: ' + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -191,7 +212,7 @@ const parseTenantsFromText = (text) => {
   const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
   const phones = [...new Set(text.match(/(?:\+91|0)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
 
-  const nameRegex = /(?:tenant|lessee|party|person|name)[\s:]*([A-Z][A-Za-z\s]{2,40}?)(?:\n|,|email|phone)/gi;
+  const nameRegex = /(?:tenant|lessee|party|person|name)[\s:]*([A-Z][A-Za-z\s]{2,40}?)(?:\n|,|email|phone|mob)/gi;
   const names = [];
   let match;
   while ((match = nameRegex.exec(text)) !== null) {
@@ -204,13 +225,12 @@ const parseTenantsFromText = (text) => {
   const tenants = [];
 
   for (let i = 0; i < maxTenants; i++) {
-    const tenant = {
+    tenants.push({
       name: uniqueNames[i] || `Tenant ${i + 1}`,
       personal_email: emails[i] || null,
       personal_phone: phones[i] || null,
       date_of_move_in: null
-    };
-    tenants.push(tenant);
+    });
   }
 
   return tenants.filter(t => t.name && (t.personal_email || t.personal_phone));
@@ -222,14 +242,14 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
 
     const text = await extractTextFromFile(req.file.buffer, req.file.mimetype);
     if (!text || text.trim().length === 0) {
-      return res.status(400).json({ error: 'Could not extract text. Try a clearer image or PDF.' });
+      return res.status(400).json({ error: 'Could not extract text from file. Ensure image/PDF is clear.' });
     }
 
     const tenantsList = parseTenantsFromText(text);
-    res.json({ success: true, extractedData: { tenants: tenantsList }, extractedText: text });
+    res.json({ success: true, extractedData: { tenants: tenantsList } });
   } catch (err) {
     console.error('Tenant extraction error:', err);
-    res.status(500).json({ error: 'Failed to extract tenant data: ' + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
