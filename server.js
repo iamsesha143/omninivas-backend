@@ -84,9 +84,15 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { property_name, city, street_address } = req.body;
+    const { property_name, city, street_address, property_type } = req.body;
     if (!property_name || !city) return res.status(400).json({ error: 'Property name and city required' });
-    const { data, error } = await supabase.from('properties').insert([{ user_id: req.userId, property_name: property_name.trim(), city: city.trim(), street_address: street_address ? street_address.trim() : '' }]).select();
+    const { data, error } = await supabase.from('properties').insert([{ 
+      user_id: req.userId, 
+      property_name: property_name.trim(), 
+      city: city.trim(), 
+      street_address: street_address ? street_address.trim() : '',
+      property_type: property_type || 'residential'
+    }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -127,64 +133,42 @@ async function tryPDFTextExtraction(buffer) {
   try {
     const uint8Array = new Uint8Array(buffer);
     const pdf = await pdfjsLib.getDocument({data: uint8Array}).promise;
-    
     let totalText = '';
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
       const textContent = await page.getTextContent();
       totalText += textContent.items.map(item => item.str || '').join('');
     }
-    
-    return {
-      isTextBased: totalText.length > 50,
-      text: totalText
-    };
+    return { isTextBased: totalText.length > 50, text: totalText };
   } catch (err) {
-    return {
-      isTextBased: false,
-      text: '',
-      error: err.message
-    };
+    return { isTextBased: false, text: '', error: err.message };
   }
 }
 
 async function extractTextFromImageBasedPDFWithImageMagick(buffer) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
-  
   try {
     console.log('🔍 PDF is image-based, using ImageMagick + Tesseract.js for OCR...');
-    
     const pdfPath = path.join(tempDir, 'input.pdf');
     fs.writeFileSync(pdfPath, buffer);
-    
     console.log('🖼️  Converting PDF pages to PNG with ImageMagick...');
     const pngPattern = path.join(tempDir, 'page.png');
-    
     try {
       execSync(`convert -density 150 "${pdfPath}" "${pngPattern}"`, { maxBuffer: 10 * 1024 * 1024 });
     } catch (err) {
       throw new Error(`ImageMagick conversion failed: ${err.message}`);
     }
-    
     const files = fs.readdirSync(tempDir).filter(f => f.startsWith('page') && f.endsWith('.png')).sort();
-    
-    if (files.length === 0) {
-      throw new Error('ImageMagick failed to generate PNG files');
-    }
-    
+    if (files.length === 0) throw new Error('ImageMagick failed to generate PNG files');
     console.log(`✅ Generated ${files.length} PNG files`);
-    
     let allText = '';
     const maxPages = Math.min(files.length, 3);
-    
     for (let i = 0; i < maxPages; i++) {
       const pngFile = path.join(tempDir, files[i]);
       console.log(`📖 Processing ${files[i]}...`);
-      
       const result = await Tesseract.recognize(pngFile, 'eng');
       allText += result.data.text + '\n';
     }
-    
     return allText;
   } catch (err) {
     throw new Error(`Image-based PDF extraction failed: ${err.message}`);
@@ -202,12 +186,9 @@ async function extractTextFromImageBasedPDFWithImageMagick(buffer) {
 async function extractDocumentText(buffer, filename, mimetype) {
   try {
     const fileType = detectFileType(filename, mimetype);
-    
     if (fileType.isPDF) {
       console.log('📄 PDF detected, analyzing content...');
-      
       const analysis = await tryPDFTextExtraction(buffer);
-      
       if (analysis.isTextBased && analysis.text.length > 50) {
         console.log(`✅ PDF is text-based, extracted ${analysis.text.length} characters`);
         return analysis.text;
@@ -216,17 +197,12 @@ async function extractDocumentText(buffer, filename, mimetype) {
         return await extractTextFromImageBasedPDFWithImageMagick(buffer);
       }
     }
-    
-    if (fileType.isWord) {
-      throw new Error('Word document extraction not yet implemented');
-    }
-    
+    if (fileType.isWord) throw new Error('Word document extraction not yet implemented');
     if (fileType.isImage) {
       console.log('🖼️ Image detected, using Tesseract.js OCR...');
       const result = await Tesseract.recognize(buffer, 'eng');
       return result.data.text;
     }
-    
     throw new Error('Unsupported file type');
   } catch (err) {
     throw new Error(`Document extraction failed: ${err.message}`);
@@ -234,14 +210,16 @@ async function extractDocumentText(buffer, filename, mimetype) {
 }
 
 const parsePropertyFromText = (text) => {
-  let city = 'Bengaluru', address = '', propertyName = 'Property';
+  if (!text) text = '';
+  let city = 'Bengaluru', address = '', propertyName = 'Property', propertyType = 'residential';
   const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
   if (cityMatch) city = cityMatch[0];
   const addressMatch = text.match(/(?:flat|wing|unit|address)[\s#:]*([A-Za-z0-9\s,\-\.]+?)(?:\n|,\s*[0-9]{6}|$)/i);
   if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
   if (address) propertyName = address.substring(0, 50);
   else propertyName = `${city} Property`;
-  return { property_name: propertyName, street_address: address, city, property_type: text.toLowerCase().includes('commercial') ? 'commercial' : 'residential' };
+  if (text.toLowerCase().includes('commercial')) propertyType = 'commercial';
+  return { property_name: propertyName || 'Property', street_address: address || '', city: city || 'Bengaluru', property_type: propertyType };
 };
 
 const parseTenantsFromText = (text) => {
@@ -252,9 +230,7 @@ const parseTenantsFromText = (text) => {
   let match;
   while ((match = nameRegex.exec(text)) !== null) {
     const name = match[1].trim();
-    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) {
-      names.push(name);
-    }
+    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) names.push(name);
   }
   const uniqueNames = [...new Set(names)];
   const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
@@ -276,9 +252,7 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
     const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
-    if (!text || text.trim().length < 50) {
-      return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
-    }
+    if (!text || text.trim().length < 50) return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     const propertyData = parsePropertyFromText(text);
     res.json({ success: true, extractedData: propertyData });
   } catch (err) {
@@ -290,9 +264,7 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
     const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
-    if (!text || text.trim().length < 50) {
-      return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
-    }
+    if (!text || text.trim().length < 50) return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     const tenants = parseTenantsFromText(text);
     res.json({ success: true, extractedData: { tenants } });
   } catch (err) {
@@ -432,12 +404,7 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
     const { data: maintenance } = await supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending');
     const totalRentPaid = payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
     const pendingMaintenance = maintenance?.reduce((sum, m) => sum + (m.amount || 0), 0) || 0;
-    res.json({
-      totalProperties: props?.length || 0,
-      totalTenants: tenants?.length || 0,
-      totalRentPaid,
-      pendingMaintenanceCosts: pendingMaintenance
-    });
+    res.json({ totalProperties: props?.length || 0, totalTenants: tenants?.length || 0, totalRentPaid, pendingMaintenanceCosts: pendingMaintenance });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
