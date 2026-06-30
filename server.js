@@ -7,6 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
+const vision = require('@google-cloud/vision');
 
 const app = express();
 
@@ -29,7 +30,24 @@ const supabase = createClient(
 );
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+
+// Initialize Vision client with parsed credentials from environment
+let visionClient = null;
+try {
+  const credentialsJson = process.env.GOOGLE_CLOUD_CREDENTIALS;
+  if (credentialsJson) {
+    const credentials = JSON.parse(credentialsJson);
+    visionClient = new vision.ImageAnnotatorClient({
+      credentials: credentials,
+      projectId: credentials.project_id
+    });
+    console.log('✅ Vision API initialized with service account');
+  } else {
+    console.warn('⚠️ GOOGLE_CLOUD_CREDENTIALS not set - Vision API will not work');
+  }
+} catch (err) {
+  console.error('❌ Failed to initialize Vision API:', err.message);
+}
 
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -44,7 +62,12 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-Production', time: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    version: 'MVP2-Vision-Verified',
+    visionReady: visionClient ? 'yes' : 'no',
+    time: new Date().toISOString() 
+  });
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -105,68 +128,88 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== CLAUDE API WITH FETCH (NO SDK) =====
+// ===== VISION API TEXT EXTRACTION =====
 
-const callClaudeAPI = async (base64, mediaType, prompt) => {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1000,
-      messages: [{
-        role: 'user',
-        content: [{
-          type: 'image',
-          source: { type: 'base64', media_type: mediaType, data: base64 }
-        }, {
-          type: 'text',
-          text: prompt
-        }]
-      }]
-    })
-  });
+const extractTextFromDocument = async (buffer) => {
+  if (!visionClient) throw new Error('Vision API not initialized');
+  
+  try {
+    const request = {
+      image: { content: buffer }
+    };
+    const [result] = await visionClient.documentTextDetection(request);
+    const text = result.fullTextAnnotation ? result.fullTextAnnotation.text : '';
+    return text;
+  } catch (err) {
+    console.error('Vision API call failed:', err);
+    throw new Error(`Vision API error: ${err.message}`);
+  }
+};
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(`Claude API error: ${error.error?.message || 'Unknown error'}`);
+const parsePropertyFromText = (text) => {
+  let city = 'Bengaluru', address = '', propertyName = 'Property';
+
+  const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
+  if (cityMatch) city = cityMatch[0];
+
+  const addressMatch = text.match(/(?:flat|wing|unit|address)[\s#:]*([A-Za-z0-9\s,\-\.]+?)(?:\n|,\s*[0-9]{6}|$)/i);
+  if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
+
+  if (address) propertyName = address.substring(0, 50);
+  else propertyName = `${city} Property`;
+
+  return {
+    property_name: propertyName,
+    street_address: address,
+    city,
+    property_type: text.toLowerCase().includes('commercial') ? 'commercial' : 'residential'
+  };
+};
+
+const parseTenantsFromText = (text) => {
+  const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
+  const phones = [...new Set(text.match(/(?:\+91)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
+
+  const nameRegex = /(?:tenant|lessee|second party|name)[\s:]*([A-Z][A-Za-z\s]{2,50}?)(?:\n|aadhar|id|email|phone|d\/o|permanent|address)/gi;
+  const names = [];
+  let match;
+  while ((match = nameRegex.exec(text)) !== null) {
+    const name = match[1].trim();
+    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) {
+      names.push(name);
+    }
   }
 
-  const data = await response.json();
-  return data.content[0].text;
+  const uniqueNames = [...new Set(names)];
+  const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
+  const tenants = [];
+
+  for (let i = 0; i < maxTenants; i++) {
+    if (uniqueNames[i] || emails[i] || phones[i]) {
+      tenants.push({
+        name: uniqueNames[i] || `Tenant ${i + 1}`,
+        personal_email: emails[i] || null,
+        personal_phone: phones[i] || null,
+        date_of_move_in: null
+      });
+    }
+  }
+
+  return tenants.filter(t => t.personal_email || t.personal_phone);
 };
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-
-    const base64 = req.file.buffer.toString('base64');
-    const mediaType = req.file.mimetype === 'application/pdf' ? 'application/pdf' : 'image/jpeg';
-
-    const prompt = `Extract ONLY the property details from this rental agreement. Look for: property name/flat number/wing, street address, and city/location.
-
-CRITICAL RULES:
-1. property_name: The ACTUAL flat/unit number + building name. NOT generic. Examples: "Flat 4162, Sobha Sentosa", "Unit 45305, Prestige Lavender Fields"
-2. street_address: The full physical address with street name and area
-3. city: The city name (Bengaluru, Mumbai, etc)
-4. property_type: "residential" or "commercial"
-
-Return ONLY valid JSON - no other text:
-{
-  "property_name": "string",
-  "street_address": "string",
-  "city": "string",
-  "property_type": "string"
-}`;
-
-    const text = await callClaudeAPI(base64, mediaType, prompt);
-    const parsed = JSON.parse(text);
-
-    res.json({ success: true, extractedData: parsed });
+    if (!visionClient) return res.status(500).json({ error: 'Vision API not available' });
+    
+    const text = await extractTextFromDocument(req.file.buffer);
+    if (!text || text.trim().length < 50) {
+      return res.status(400).json({ error: 'Could not extract text from document' });
+    }
+    
+    const propertyData = parsePropertyFromText(text);
+    res.json({ success: true, extractedData: propertyData });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
@@ -175,33 +218,14 @@ Return ONLY valid JSON - no other text:
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-
-    const base64 = req.file.buffer.toString('base64');
-    const mediaType = req.file.mimetype === 'application/pdf' ? 'application/pdf' : 'image/jpeg';
-
-    const prompt = `Extract ALL tenant/lessee information from this rental agreement. Look for the section labeled "tenant", "lessee", "second party", or similar.
-
-CRITICAL RULES:
-1. Find every person listed as a tenant/lessee
-2. Extract their FULL NAME (not abbreviated, all caps if written that way)
-3. Extract email address if present
-4. Extract phone number if present (may be in different formats)
-5. Extract move-in date if present
-6. If information is missing, use null
-
-Return ONLY a JSON array - no other text:
-[
-  {
-    "name": "string (FULL NAME)",
-    "personal_email": "string or null",
-    "personal_phone": "string or null",
-    "date_of_move_in": "YYYY-MM-DD or null"
-  }
-]`;
-
-    const text = await callClaudeAPI(base64, mediaType, prompt);
-    const tenants = JSON.parse(text);
-
+    if (!visionClient) return res.status(500).json({ error: 'Vision API not available' });
+    
+    const text = await extractTextFromDocument(req.file.buffer);
+    if (!text || text.trim().length < 50) {
+      return res.status(400).json({ error: 'Could not extract text from document' });
+    }
+    
+    const tenants = parseTenantsFromText(text);
     res.json({ success: true, extractedData: { tenants } });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
