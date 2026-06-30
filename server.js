@@ -84,16 +84,22 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { property_name, city, state, street_address, property_type } = req.body;
-    if (!property_name || !city) return res.status(400).json({ error: 'Property name and city required' });
+    const { property_name, city, state, street_address, pincode, property_type } = req.body;
+    
+    if (!property_name || !city || !state || !street_address || !pincode) {
+      return res.status(400).json({ error: 'Property name, city, state, street address, and pincode required' });
+    }
+    
     const { data, error } = await supabase.from('properties').insert([{ 
       user_id: req.userId, 
-      property_name: (property_name || 'Property').trim(), 
-      city: (city || 'Bengaluru').trim(), 
-      state: (state || 'Karnataka').trim(),
-      street_address: (street_address || '').trim(),
+      property_name: property_name.trim(), 
+      city: city.trim(), 
+      state: state.trim(),
+      street_address: street_address.trim(),
+      pincode: pincode.trim(),
       property_type: property_type || 'residential'
     }]).select();
+    
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -212,13 +218,22 @@ async function extractDocumentText(buffer, filename, mimetype) {
 
 const parsePropertyFromText = (text) => {
   if (!text) text = '';
-  let city = 'Bengaluru', state = 'Karnataka', address = '', propertyName = 'Property', propertyType = 'residential';
+  
+  let city = 'Bengaluru';
+  let state = 'Karnataka';
+  let pincode = '560000';
+  let address = '';
+  let propertyName = 'Property';
+  let propertyType = 'residential';
   
   const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
   if (cityMatch) city = cityMatch[0];
   
   const stateMatch = text.match(/(?:karnataka|maharashtra|delhi|tamilnadu|telangana|punjab|haryana|uttar\s+pradesh|rajasthan|gujarat|west\s+bengal)/i);
   if (stateMatch) state = stateMatch[0];
+  
+  const pincodeMatch = text.match(/\b[0-9]{6}\b/);
+  if (pincodeMatch) pincode = pincodeMatch[0];
   
   const addressMatch = text.match(/(?:flat|wing|unit|address)[\s#:]*([A-Za-z0-9\s,\-\.]+?)(?:\n|,\s*[0-9]{6}|$)/i);
   if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
@@ -230,9 +245,10 @@ const parsePropertyFromText = (text) => {
   
   return { 
     property_name: propertyName || 'Property', 
-    street_address: address || '', 
+    street_address: address || '10 Street, Block A',
     city: city || 'Bengaluru',
     state: state || 'Karnataka',
+    pincode: pincode || '560000',
     property_type: propertyType 
   };
 };
