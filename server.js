@@ -86,16 +86,16 @@ app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, city, state, street_address, pincode, property_type } = req.body;
     
-    if (!property_name || !city || !state || !street_address || !pincode) {
-      return res.status(400).json({ error: 'Property name, city, state, street address, and pincode required' });
+    if (!property_name || !city || !state || !pincode) {
+      return res.status(400).json({ error: 'Property name, city, state, and pincode required' });
     }
-    
-    const { data, error } = await supabase.from('properties').insert([{ 
-      user_id: req.userId, 
-      property_name: property_name.trim(), 
-      city: city.trim(), 
+
+    const { data, error } = await supabase.from('properties').insert([{
+      user_id: req.userId,
+      property_name: property_name.trim(),
+      city: city.trim(),
       state: state.trim(),
-      street_address: street_address.trim(),
+      street_address: street_address ? street_address.trim() : '',
       pincode: pincode.trim(),
       property_type: property_type || 'residential'
     }]).select();
