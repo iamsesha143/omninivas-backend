@@ -7,10 +7,8 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
-const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
-const client = new Anthropic();
 
 app.use(cors({
   origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000'],
@@ -31,6 +29,7 @@ const supabase = createClient(
 );
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -45,7 +44,7 @@ const verifyToken = (req, res, next) => {
 };
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: 'MVP2-Claude-Fixed', time: new Date().toISOString() });
+  res.json({ status: 'ok', version: 'MVP2-Production', time: new Date().toISOString() });
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -106,7 +105,40 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== IMPROVED EXTRACTION WITH CLAUDE =====
+// ===== CLAUDE API WITH FETCH (NO SDK) =====
+
+const callClaudeAPI = async (base64, mediaType, prompt) => {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'image',
+          source: { type: 'base64', media_type: mediaType, data: base64 }
+        }, {
+          type: 'text',
+          text: prompt
+        }]
+      }]
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(`Claude API error: ${error.error?.message || 'Unknown error'}`);
+  }
+
+  const data = await response.json();
+  return data.content[0].text;
+};
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -115,17 +147,7 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     const base64 = req.file.buffer.toString('base64');
     const mediaType = req.file.mimetype === 'application/pdf' ? 'application/pdf' : 'image/jpeg';
 
-    const response = await client.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 500,
-      messages: [{
-        role: 'user',
-        content: [{
-          type: 'document',
-          source: { type: 'base64', media_type: mediaType, data: base64 }
-        }, {
-          type: 'text',
-          text: `Extract ONLY the property details from this rental agreement. Look for: property name/flat number/wing, street address, and city/location.
+    const prompt = `Extract ONLY the property details from this rental agreement. Look for: property name/flat number/wing, street address, and city/location.
 
 CRITICAL RULES:
 1. property_name: The ACTUAL flat/unit number + building name. NOT generic. Examples: "Flat 4162, Sobha Sentosa", "Unit 45305, Prestige Lavender Fields"
@@ -139,12 +161,9 @@ Return ONLY valid JSON - no other text:
   "street_address": "string",
   "city": "string",
   "property_type": "string"
-}`
-        }]
-      }]
-    });
+}`;
 
-    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    const text = await callClaudeAPI(base64, mediaType, prompt);
     const parsed = JSON.parse(text);
 
     res.json({ success: true, extractedData: parsed });
@@ -160,17 +179,7 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
     const base64 = req.file.buffer.toString('base64');
     const mediaType = req.file.mimetype === 'application/pdf' ? 'application/pdf' : 'image/jpeg';
 
-    const response = await client.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1000,
-      messages: [{
-        role: 'user',
-        content: [{
-          type: 'document',
-          source: { type: 'base64', media_type: mediaType, data: base64 }
-        }, {
-          type: 'text',
-          text: `Extract ALL tenant/lessee information from this rental agreement. Look for the section labeled "tenant", "lessee", "second party", or similar.
+    const prompt = `Extract ALL tenant/lessee information from this rental agreement. Look for the section labeled "tenant", "lessee", "second party", or similar.
 
 CRITICAL RULES:
 1. Find every person listed as a tenant/lessee
@@ -188,12 +197,9 @@ Return ONLY a JSON array - no other text:
     "personal_phone": "string or null",
     "date_of_move_in": "YYYY-MM-DD or null"
   }
-]`
-        }]
-      }]
-    });
+]`;
 
-    const text = response.content[0].type === 'text' ? response.content[0].text : '';
+    const text = await callClaudeAPI(base64, mediaType, prompt);
     const tenants = JSON.parse(text);
 
     res.json({ success: true, extractedData: { tenants } });
