@@ -358,6 +358,22 @@ app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.singl
   }
 });
 
+app.get('/api/properties/:propertyId/documents', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.storage.from('documents').list(`properties/${req.params.propertyId}`, { limit: 100, sortBy: { column: 'created_at', order: 'desc' } });
+    if (error) throw error;
+    const files = (data || []).map(f => ({
+      name: f.name,
+      created_at: f.created_at,
+      size: f.metadata?.size,
+      url: `properties/${req.params.propertyId}/${f.name}`
+    }));
+    res.json(files);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
