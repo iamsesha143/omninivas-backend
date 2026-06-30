@@ -84,13 +84,14 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { property_name, city, street_address, property_type } = req.body;
+    const { property_name, city, state, street_address, property_type } = req.body;
     if (!property_name || !city) return res.status(400).json({ error: 'Property name and city required' });
     const { data, error } = await supabase.from('properties').insert([{ 
       user_id: req.userId, 
-      property_name: property_name.trim(), 
-      city: city.trim(), 
-      street_address: street_address ? street_address.trim() : '',
+      property_name: (property_name || 'Property').trim(), 
+      city: (city || 'Bengaluru').trim(), 
+      state: (state || 'Karnataka').trim(),
+      street_address: (street_address || '').trim(),
       property_type: property_type || 'residential'
     }]).select();
     if (error) throw error;
@@ -211,15 +212,29 @@ async function extractDocumentText(buffer, filename, mimetype) {
 
 const parsePropertyFromText = (text) => {
   if (!text) text = '';
-  let city = 'Bengaluru', address = '', propertyName = 'Property', propertyType = 'residential';
+  let city = 'Bengaluru', state = 'Karnataka', address = '', propertyName = 'Property', propertyType = 'residential';
+  
   const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
   if (cityMatch) city = cityMatch[0];
+  
+  const stateMatch = text.match(/(?:karnataka|maharashtra|delhi|tamilnadu|telangana|punjab|haryana|uttar\s+pradesh|rajasthan|gujarat|west\s+bengal)/i);
+  if (stateMatch) state = stateMatch[0];
+  
   const addressMatch = text.match(/(?:flat|wing|unit|address)[\s#:]*([A-Za-z0-9\s,\-\.]+?)(?:\n|,\s*[0-9]{6}|$)/i);
   if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
+  
   if (address) propertyName = address.substring(0, 50);
   else propertyName = `${city} Property`;
+  
   if (text.toLowerCase().includes('commercial')) propertyType = 'commercial';
-  return { property_name: propertyName || 'Property', street_address: address || '', city: city || 'Bengaluru', property_type: propertyType };
+  
+  return { 
+    property_name: propertyName || 'Property', 
+    street_address: address || '', 
+    city: city || 'Bengaluru',
+    state: state || 'Karnataka',
+    property_type: propertyType 
+  };
 };
 
 const parseTenantsFromText = (text) => {
@@ -291,9 +306,9 @@ app.post('/api/properties/:propertyId/tenants/bulk', verifyToken, async (req, re
     const tenantsToInsert = tenants.map(t => ({
       property_id: req.params.propertyId,
       user_id: req.userId,
-      name: t.name?.trim() || '',
-      personal_email: t.personal_email?.trim().toLowerCase() || '',
-      personal_phone: t.personal_phone?.trim() || '',
+      name: (t.name || '').trim(),
+      personal_email: (t.personal_email || '').trim().toLowerCase(),
+      personal_phone: (t.personal_phone || '').trim(),
       date_of_move_in: t.date_of_move_in || null,
       is_active: true
     })).filter(t => t.name && t.personal_email);
