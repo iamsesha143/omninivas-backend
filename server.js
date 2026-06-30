@@ -7,7 +7,12 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const multer = require('multer');
 const ws = require('ws');
-const vision = require('@google-cloud/vision');
+const pdfjsLib = require('pdfjs-dist/legacy/build/pdf');
+const Tesseract = require('tesseract.js');
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const app = express();
 
@@ -31,21 +36,6 @@ const supabase = createClient(
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
 
-let visionClient = null;
-try {
-  const credentialsJson = process.env.GOOGLE_CLOUD_CREDENTIALS;
-  if (credentialsJson) {
-    const credentials = JSON.parse(credentialsJson);
-    visionClient = new vision.ImageAnnotatorClient({
-      credentials: credentials,
-      projectId: credentials.project_id
-    });
-    console.log('✅ Vision API initialized');
-  }
-} catch (err) {
-  console.error('❌ Vision init failed:', err.message);
-}
-
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
@@ -61,8 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2-TextAnnotations-Fix',
-    visionReady: visionClient ? 'yes' : 'no',
+    version: 'MVP2-ImageMagick-Tesseract',
     time: new Date().toISOString() 
   });
 });
@@ -125,63 +114,139 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ===== VISION API TEXT EXTRACTION =====
+function detectFileType(filename, mimetype) {
+  const ext = filename.toLowerCase().split('.').pop();
+  return {
+    isPDF: ext === 'pdf' || mimetype === 'application/pdf',
+    isWord: ext.includes('doc') || mimetype.includes('word'),
+    isImage: mimetype.includes('image')
+  };
+}
 
-const extractTextFromDocument = async (buffer) => {
-  if (!visionClient) throw new Error('Vision API not initialized');
+async function tryPDFTextExtraction(buffer) {
+  try {
+    const uint8Array = new Uint8Array(buffer);
+    const pdf = await pdfjsLib.getDocument({data: uint8Array}).promise;
+    
+    let totalText = '';
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      const textContent = await page.getTextContent();
+      totalText += textContent.items.map(item => item.str || '').join('');
+    }
+    
+    return {
+      isTextBased: totalText.length > 50,
+      text: totalText
+    };
+  } catch (err) {
+    return {
+      isTextBased: false,
+      text: '',
+      error: err.message
+    };
+  }
+}
+
+async function extractTextFromImageBasedPDFWithImageMagick(buffer) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-'));
   
   try {
-    const request = {
-      image: { content: buffer }
-    };
+    console.log('🔍 PDF is image-based, using ImageMagick + Tesseract.js for OCR...');
     
-    const [result] = await visionClient.documentTextDetection(request);
+    const pdfPath = path.join(tempDir, 'input.pdf');
+    fs.writeFileSync(pdfPath, buffer);
     
-    // Try fullTextAnnotation first (for documents)
-    if (result.fullTextAnnotation && result.fullTextAnnotation.text) {
-      console.log(`✅ Extracted from fullTextAnnotation: ${result.fullTextAnnotation.text.length} chars`);
-      return result.fullTextAnnotation.text;
+    console.log('🖼️  Converting PDF pages to PNG with ImageMagick...');
+    const pngPattern = path.join(tempDir, 'page.png');
+    
+    try {
+      execSync(`convert -density 150 "${pdfPath}" "${pngPattern}"`, { maxBuffer: 10 * 1024 * 1024 });
+    } catch (err) {
+      throw new Error(`ImageMagick conversion failed: ${err.message}`);
     }
     
-    // Fallback to textAnnotations (for searchable PDFs)
-    if (result.textAnnotations && result.textAnnotations.length > 0) {
-      const text = result.textAnnotations[0].description || '';
-      console.log(`✅ Extracted from textAnnotations[0]: ${text.length} chars`);
-      return text;
+    const files = fs.readdirSync(tempDir).filter(f => f.startsWith('page') && f.endsWith('.png')).sort();
+    
+    if (files.length === 0) {
+      throw new Error('ImageMagick failed to generate PNG files');
     }
     
-    console.log('❌ No text found in either fullTextAnnotation or textAnnotations');
-    return '';
+    console.log(`✅ Generated ${files.length} PNG files`);
+    
+    let allText = '';
+    const maxPages = Math.min(files.length, 3);
+    
+    for (let i = 0; i < maxPages; i++) {
+      const pngFile = path.join(tempDir, files[i]);
+      console.log(`📖 Processing ${files[i]}...`);
+      
+      const result = await Tesseract.recognize(pngFile, 'eng');
+      allText += result.data.text + '\n';
+    }
+    
+    return allText;
   } catch (err) {
-    console.error('❌ Vision API error:', err.message);
-    throw err;
+    throw new Error(`Image-based PDF extraction failed: ${err.message}`);
+  } finally {
+    try {
+      const files = fs.readdirSync(tempDir);
+      files.forEach(f => fs.unlinkSync(path.join(tempDir, f)));
+      fs.rmdirSync(tempDir);
+    } catch (err) {
+      console.warn('Cleanup warning:', err.message);
+    }
   }
-};
+}
+
+async function extractDocumentText(buffer, filename, mimetype) {
+  try {
+    const fileType = detectFileType(filename, mimetype);
+    
+    if (fileType.isPDF) {
+      console.log('📄 PDF detected, analyzing content...');
+      
+      const analysis = await tryPDFTextExtraction(buffer);
+      
+      if (analysis.isTextBased && analysis.text.length > 50) {
+        console.log(`✅ PDF is text-based, extracted ${analysis.text.length} characters`);
+        return analysis.text;
+      } else {
+        console.log('⚠️ PDF is image-based, falling back to ImageMagick + Tesseract.js');
+        return await extractTextFromImageBasedPDFWithImageMagick(buffer);
+      }
+    }
+    
+    if (fileType.isWord) {
+      throw new Error('Word document extraction not yet implemented');
+    }
+    
+    if (fileType.isImage) {
+      console.log('🖼️ Image detected, using Tesseract.js OCR...');
+      const result = await Tesseract.recognize(buffer, 'eng');
+      return result.data.text;
+    }
+    
+    throw new Error('Unsupported file type');
+  } catch (err) {
+    throw new Error(`Document extraction failed: ${err.message}`);
+  }
+}
 
 const parsePropertyFromText = (text) => {
   let city = 'Bengaluru', address = '', propertyName = 'Property';
-
   const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
   if (cityMatch) city = cityMatch[0];
-
   const addressMatch = text.match(/(?:flat|wing|unit|address)[\s#:]*([A-Za-z0-9\s,\-\.]+?)(?:\n|,\s*[0-9]{6}|$)/i);
   if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
-
   if (address) propertyName = address.substring(0, 50);
   else propertyName = `${city} Property`;
-
-  return {
-    property_name: propertyName,
-    street_address: address,
-    city,
-    property_type: text.toLowerCase().includes('commercial') ? 'commercial' : 'residential'
-  };
+  return { property_name: propertyName, street_address: address, city, property_type: text.toLowerCase().includes('commercial') ? 'commercial' : 'residential' };
 };
 
 const parseTenantsFromText = (text) => {
   const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
   const phones = [...new Set(text.match(/(?:\+91)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
-
   const nameRegex = /(?:tenant|lessee|second party|name)[\s:]*([A-Z][A-Za-z\s]{2,50}?)(?:\n|aadhar|id|email|phone|d\/o|permanent|address)/gi;
   const names = [];
   let match;
@@ -191,11 +256,9 @@ const parseTenantsFromText = (text) => {
       names.push(name);
     }
   }
-
   const uniqueNames = [...new Set(names)];
   const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
   const tenants = [];
-
   for (let i = 0; i < maxTenants; i++) {
     if (uniqueNames[i] || emails[i] || phones[i]) {
       tenants.push({
@@ -206,21 +269,16 @@ const parseTenantsFromText = (text) => {
       });
     }
   }
-
   return tenants.filter(t => t.personal_email || t.personal_phone);
 };
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    if (!visionClient) return res.status(500).json({ error: 'Vision API not available' });
-    
-    const text = await extractTextFromDocument(req.file.buffer);
-    
+    const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
     if (!text || text.trim().length < 50) {
       return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     }
-    
     const propertyData = parsePropertyFromText(text);
     res.json({ success: true, extractedData: propertyData });
   } catch (err) {
@@ -231,22 +289,16 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
 app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    if (!visionClient) return res.status(500).json({ error: 'Vision API not available' });
-    
-    const text = await extractTextFromDocument(req.file.buffer);
-    
+    const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
     if (!text || text.trim().length < 50) {
       return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     }
-    
     const tenants = parseTenantsFromText(text);
     res.json({ success: true, extractedData: { tenants } });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
 });
-
-// ===== TENANTS =====
 
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
@@ -291,8 +343,6 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   }
 });
 
-// ===== DOCUMENTS =====
-
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
@@ -318,8 +368,6 @@ app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', ver
   }
 });
 
-// ===== PAYMENTS =====
-
 app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
   try {
     const { tenant_id, amount, payment_date, status } = req.body;
@@ -341,8 +389,6 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
     res.status(500).json({ error: err.message });
   }
 });
-
-// ===== MAINTENANCE =====
 
 app.post('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
   try {
@@ -377,8 +423,6 @@ app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken,
     res.status(500).json({ error: err.message });
   }
 });
-
-// ===== DASHBOARD =====
 
 app.get('/api/dashboard', verifyToken, async (req, res) => {
   try {
