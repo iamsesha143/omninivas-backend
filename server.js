@@ -61,7 +61,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2-Logging',
+    version: 'MVP2-TextAnnotations-Fix',
     visionReady: visionClient ? 'yes' : 'no',
     time: new Date().toISOString() 
   });
@@ -131,25 +131,27 @@ const extractTextFromDocument = async (buffer) => {
   if (!visionClient) throw new Error('Vision API not initialized');
   
   try {
-    console.log(`📄 Processing document: ${buffer.length} bytes`);
-    
     const request = {
       image: { content: buffer }
     };
     
     const [result] = await visionClient.documentTextDetection(request);
     
-    console.log('📋 Vision API response keys:', Object.keys(result));
-    console.log('📋 fullTextAnnotation exists?', !!result.fullTextAnnotation);
-    
-    if (result.fullTextAnnotation) {
-      console.log('📋 fullTextAnnotation keys:', Object.keys(result.fullTextAnnotation));
-      console.log('📋 Text length:', result.fullTextAnnotation.text ? result.fullTextAnnotation.text.length : 0);
+    // Try fullTextAnnotation first (for documents)
+    if (result.fullTextAnnotation && result.fullTextAnnotation.text) {
+      console.log(`✅ Extracted from fullTextAnnotation: ${result.fullTextAnnotation.text.length} chars`);
+      return result.fullTextAnnotation.text;
     }
     
-    const text = result.fullTextAnnotation ? result.fullTextAnnotation.text : '';
-    console.log(`✅ Extracted ${text.length} characters`);
-    return text;
+    // Fallback to textAnnotations (for searchable PDFs)
+    if (result.textAnnotations && result.textAnnotations.length > 0) {
+      const text = result.textAnnotations[0].description || '';
+      console.log(`✅ Extracted from textAnnotations[0]: ${text.length} chars`);
+      return text;
+    }
+    
+    console.log('❌ No text found in either fullTextAnnotation or textAnnotations');
+    return '';
   } catch (err) {
     console.error('❌ Vision API error:', err.message);
     throw err;
@@ -215,18 +217,13 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     
     const text = await extractTextFromDocument(req.file.buffer);
     
-    console.log(`🔍 Text extracted: ${text.length} chars, checking if >= 50...`);
-    
     if (!text || text.trim().length < 50) {
-      console.log(`❌ Text too short: ${text.trim().length} chars`);
       return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     }
     
     const propertyData = parsePropertyFromText(text);
-    console.log(`✅ Property parsed:`, propertyData);
     res.json({ success: true, extractedData: propertyData });
   } catch (err) {
-    console.error(`❌ Extract property error:`, err);
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
 });
