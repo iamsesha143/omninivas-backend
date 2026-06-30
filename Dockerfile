@@ -1,24 +1,22 @@
 FROM node:20-bookworm
 
-# Install ImageMagick and other dependencies
+# Install ImageMagick and Ghostscript
 RUN apt-get update && apt-get install -y \
     imagemagick \
     ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
+# Fix ImageMagick security policy to allow PDF
+RUN sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/g' /etc/ImageMagick-6/policy.xml
+
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
 
-# Install Node dependencies
 RUN npm ci --omit=dev
 
-# Copy app code
 COPY . .
 
-# Expose port
 EXPOSE 8080
 
-# Start app
 CMD ["npm", "start"]
