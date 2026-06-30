@@ -31,7 +31,6 @@ const supabase = createClient(
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
 
-// Initialize Vision client with parsed credentials from environment
 let visionClient = null;
 try {
   const credentialsJson = process.env.GOOGLE_CLOUD_CREDENTIALS;
@@ -41,12 +40,10 @@ try {
       credentials: credentials,
       projectId: credentials.project_id
     });
-    console.log('✅ Vision API initialized with service account');
-  } else {
-    console.warn('⚠️ GOOGLE_CLOUD_CREDENTIALS not set - Vision API will not work');
+    console.log('✅ Vision API initialized');
   }
 } catch (err) {
-  console.error('❌ Failed to initialize Vision API:', err.message);
+  console.error('❌ Vision init failed:', err.message);
 }
 
 const verifyToken = (req, res, next) => {
@@ -64,7 +61,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2-Vision-Verified',
+    version: 'MVP2-Logging',
     visionReady: visionClient ? 'yes' : 'no',
     time: new Date().toISOString() 
   });
@@ -134,15 +131,28 @@ const extractTextFromDocument = async (buffer) => {
   if (!visionClient) throw new Error('Vision API not initialized');
   
   try {
+    console.log(`📄 Processing document: ${buffer.length} bytes`);
+    
     const request = {
       image: { content: buffer }
     };
+    
     const [result] = await visionClient.documentTextDetection(request);
+    
+    console.log('📋 Vision API response keys:', Object.keys(result));
+    console.log('📋 fullTextAnnotation exists?', !!result.fullTextAnnotation);
+    
+    if (result.fullTextAnnotation) {
+      console.log('📋 fullTextAnnotation keys:', Object.keys(result.fullTextAnnotation));
+      console.log('📋 Text length:', result.fullTextAnnotation.text ? result.fullTextAnnotation.text.length : 0);
+    }
+    
     const text = result.fullTextAnnotation ? result.fullTextAnnotation.text : '';
+    console.log(`✅ Extracted ${text.length} characters`);
     return text;
   } catch (err) {
-    console.error('Vision API call failed:', err);
-    throw new Error(`Vision API error: ${err.message}`);
+    console.error('❌ Vision API error:', err.message);
+    throw err;
   }
 };
 
@@ -204,13 +214,19 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     if (!visionClient) return res.status(500).json({ error: 'Vision API not available' });
     
     const text = await extractTextFromDocument(req.file.buffer);
+    
+    console.log(`🔍 Text extracted: ${text.length} chars, checking if >= 50...`);
+    
     if (!text || text.trim().length < 50) {
-      return res.status(400).json({ error: 'Could not extract text from document' });
+      console.log(`❌ Text too short: ${text.trim().length} chars`);
+      return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     }
     
     const propertyData = parsePropertyFromText(text);
+    console.log(`✅ Property parsed:`, propertyData);
     res.json({ success: true, extractedData: propertyData });
   } catch (err) {
+    console.error(`❌ Extract property error:`, err);
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
 });
@@ -221,8 +237,9 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
     if (!visionClient) return res.status(500).json({ error: 'Vision API not available' });
     
     const text = await extractTextFromDocument(req.file.buffer);
+    
     if (!text || text.trim().length < 50) {
-      return res.status(400).json({ error: 'Could not extract text from document' });
+      return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     }
     
     const tenants = parseTenantsFromText(text);
