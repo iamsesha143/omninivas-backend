@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.3-schema-debug',
+    version: 'MVP2.4-probe',
     time: new Date().toISOString() 
   });
 });
@@ -445,13 +445,15 @@ app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken,
   }
 });
 
-// TEMPORARY: returns DB schema via PostgREST OpenAPI doc; remove after schema audit
-app.get('/api/debug/schema', verifyToken, async (req, res) => {
+// TEMPORARY: raw table probe for schema audit; remove after audit
+app.post('/api/debug/probe', verifyToken, async (req, res) => {
   try {
-    const r = await fetch(`${process.env.SUPABASE_URL}/rest/v1/`, {
-      headers: { apikey: process.env.SUPABASE_KEY, Authorization: `Bearer ${process.env.SUPABASE_KEY}` }
-    });
-    res.json(await r.json());
+    const { table, action, payload, match } = req.body;
+    let out;
+    if (action === 'insert') out = await supabase.from(table).insert([payload]).select();
+    else if (action === 'delete') out = await supabase.from(table).delete().match(match).select();
+    else out = await supabase.from(table).select('*').limit(1);
+    res.json({ data: out.data, error: out.error });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
