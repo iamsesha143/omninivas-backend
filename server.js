@@ -42,16 +42,22 @@ const verifyToken = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.userId = decoded.sub;
+    req.role = decoded.role || 'owner';
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
   }
 };
 
+const requireOwner = (req, res, next) => {
+  if (req.role !== 'owner') return res.status(403).json({ error: 'Owner access only' });
+  next();
+};
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP3.1-assets-vendors-invites-renewals',
+    version: 'MVP3.2-tenant-login',
     time: new Date().toISOString() 
   });
 });
@@ -73,8 +79,8 @@ app.post('/api/auth/register', async (req, res) => {
     }
     if (error) throw error;
     delete data[0].password_hash;
-    const token = jwt.sign({ sub: data[0].id, email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ user: data[0], token });
+    const token = jwt.sign({ sub: data[0].id, email, role: 'owner' }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ user: data[0], token, role: 'owner' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -95,8 +101,9 @@ app.post('/api/auth/login', async (req, res) => {
       await supabase.from('users').update({ password_hash }).eq('id', data.id);
     }
     delete data.password_hash;
-    const token = jwt.sign({ sub: data.id, email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ user: data, token });
+    const role = data.role || 'owner';
+    const token = jwt.sign({ sub: data.id, email, role }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ user: data, token, role });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -733,6 +740,127 @@ app.post('/api/invite/:token', async (req, res) => {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { error } = await supabase.from('tenants').update(allowed).eq('id', tenant.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUBLIC: tenant sets a password on their invite link -> creates their login account
+app.post('/api/invite/:token/register', async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const { data: tenant, error: e0 } = await supabase.from('tenants').select('id,name,personal_email,personal_phone,login_user_id').eq('share_token', req.params.token).single();
+    if (e0 || !tenant) return res.status(404).json({ error: 'Invalid or expired link' });
+    const email = (tenant.personal_email && tenant.personal_email.trim()) || `tenant+${tenant.id.slice(0, 8)}@omninivas.app`;
+    const password_hash = await bcrypt.hash(password, 10);
+    let loginId = tenant.login_user_id;
+    if (loginId) {
+      await supabase.from('users').update({ password_hash }).eq('id', loginId);
+    } else {
+      const { data: existing } = await supabase.from('users').select('id').eq('email', email.toLowerCase()).maybeSingle();
+      if (existing) return res.status(409).json({ error: 'An account with this email already exists. Ask your landlord to use a different email.' });
+      const { data: u, error: e1 } = await supabase.from('users').insert([{ email: email.toLowerCase(), full_name: tenant.name, role: 'tenant', password_hash, whatsapp_webhook_token: crypto.randomBytes(16).toString('hex') }]).select();
+      if (e1) throw e1;
+      loginId = u[0].id;
+      await supabase.from('tenants').update({ login_user_id: loginId }).eq('id', tenant.id);
+    }
+    const token = jwt.sign({ sub: loginId, email: email.toLowerCase(), role: 'tenant' }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, role: 'tenant', email: email.toLowerCase() });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// TENANT PORTAL: everything a logged-in tenant sees about their own tenancy
+app.get('/api/tenant/home', verifyToken, async (req, res) => {
+  try {
+    const { data: tenant, error } = await supabase.from('tenants').select('*').eq('login_user_id', req.userId).eq('is_active', true).maybeSingle();
+    if (error) throw error;
+    if (!tenant) return res.status(404).json({ error: 'No tenancy linked to this login' });
+    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone').eq('id', tenant.property_id).single();
+    const month = new Date().toISOString().slice(0, 7);
+    const period = `${month}-01`;
+    const [{ data: obligations }, { data: monthPayments }, { data: history }] = await Promise.all([
+      supabase.from('obligations').select('*').eq('property_id', tenant.property_id).eq('active', true).eq('paid_by', 'tenant'),
+      supabase.from('payments').select('*').eq('property_id', tenant.property_id).eq('period', period),
+      supabase.from('payments').select('id,amount,payment_date,status,period,obligation_id').eq('property_id', tenant.property_id).order('payment_date', { ascending: false }).limit(24)
+    ]);
+    const today = new Date().toISOString().slice(0, 10);
+    const dues = (obligations || []).map(o => {
+      const payment = (monthPayments || []).find(p => p.obligation_id === o.id && p.status !== 'rejected') || null;
+      const dueDate = `${month}-${String(Math.min(o.due_day || 5, 28)).padStart(2, '0')}`;
+      let status = 'due';
+      if (payment && payment.status === 'paid') status = 'paid';
+      else if (payment) status = 'pending_confirmation';
+      else if (dueDate < today) status = 'overdue';
+      return { obligation: o, payment, status, due_date: dueDate };
+    });
+    res.json({
+      tenant: { name: tenant.name, personal_phone: tenant.personal_phone, personal_email: tenant.personal_email, date_of_move_in: tenant.date_of_move_in, deposit_amount: tenant.deposit_amount },
+      property, month, dues, history: history || []
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// TENANT: upload a payment proof for one of their own bills
+app.post('/api/tenant/obligations/:obligationId/proof', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const { data: tenant } = await supabase.from('tenants').select('id,property_id,user_id').eq('login_user_id', req.userId).maybeSingle();
+    if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
+    const { data: obligation } = await supabase.from('obligations').select('*').eq('id', req.params.obligationId).eq('property_id', tenant.property_id).single();
+    if (!obligation) return res.status(404).json({ error: 'Bill not found' });
+    const month = /^\d{4}-\d{2}$/.test(req.body.month || '') ? req.body.month : new Date().toISOString().slice(0, 7);
+    const fileName = `proofs/${tenant.property_id}/${obligation.id}_${month}_${Date.now()}`;
+    await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype }).catch(() => {});
+    let extracted = { amount: null, date: null, utr: null };
+    try { extracted = parsePaymentProof(await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype)); } catch (e) {}
+    const { data, error } = await supabase.from('payments').insert([{
+      property_id: tenant.property_id, user_id: tenant.user_id, tenant_id: tenant.id,
+      obligation_id: obligation.id, period: `${month}-01`,
+      amount: extracted.amount || obligation.amount || 0,
+      payment_date: extracted.date || new Date().toISOString().slice(0, 10),
+      status: 'pending', proof_url: fileName, utr_number: extracted.utr || null
+    }]).select();
+    if (error) throw error;
+    res.status(201).json({ payment: data[0], extracted });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// OWNER: update tenant details (deposit, screening, move-out, etc.)
+app.patch('/api/tenants/:id', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { data, error } = await supabase.from('tenants').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// OWNER: co-occupants (other people living with a tenant)
+app.post('/api/tenants/:tenantId/occupants', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { name, relationship, age, phone, id_type, id_number } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    const { data, error } = await supabase.from('co_occupants').insert([{ tenant_id: req.params.tenantId, user_id: req.userId, name: name.trim(), relationship: relationship || null, age: age ? parseInt(age, 10) : null, phone: phone || null, id_type: id_type || null, id_number: id_number || null }]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/tenants/:tenantId/occupants', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('co_occupants').select('*').eq('tenant_id', req.params.tenantId).eq('user_id', req.userId).order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/occupants/:id', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { error } = await supabase.from('co_occupants').delete().eq('id', req.params.id).eq('user_id', req.userId);
     if (error) throw error;
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
