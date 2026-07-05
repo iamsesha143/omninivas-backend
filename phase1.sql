@@ -4,9 +4,11 @@
 -- ============================================================
 
 -- 1) WIPE ALL DATA (requested fresh start — deletes every account,
---    property, tenant, payment, and uploaded document)
+--    property, tenant, and payment record)
+-- NOTE: old uploaded files in Storage can't be deleted from SQL. Clear them
+-- separately if you want: Supabase Dashboard -> Storage -> documents -> select all -> delete.
+-- They're harmless orphans otherwise.
 TRUNCATE TABLE payments, maintenance_costs, tenants, properties, users CASCADE;
-DELETE FROM storage.objects WHERE bucket_id = 'documents';
 
 -- 2) OBLIGATIONS: recurring dues per property (rent, electricity,
 --    society maintenance, water...) with who-pays and due day
