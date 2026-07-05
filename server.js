@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.4-probe',
+    version: 'MVP2.5-tenant-payment-defaults',
     time: new Date().toISOString() 
   });
 });
@@ -308,7 +308,7 @@ app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) =>
     const { name, personal_email, personal_phone, date_of_move_in } = req.body;
     if (!name) return res.status(400).json({ error: 'Name required' });
     if (!personal_email && !personal_phone) return res.status(400).json({ error: 'Email or phone required' });
-    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : '', personal_phone: personal_phone ? personal_phone.trim() : '', date_of_move_in: date_of_move_in || null, is_active: true }]).select();
+    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : '', personal_phone: personal_phone ? personal_phone.trim() : '', date_of_move_in: date_of_move_in || new Date().toISOString().split('T')[0], occupancy_type: 'single', is_active: true }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -326,7 +326,8 @@ app.post('/api/properties/:propertyId/tenants/bulk', verifyToken, async (req, re
       name: (t.name || '').trim(),
       personal_email: t.personal_email ? t.personal_email.trim().toLowerCase() : '',
       personal_phone: (t.personal_phone || '').trim(),
-      date_of_move_in: t.date_of_move_in || null,
+      date_of_move_in: t.date_of_move_in || new Date().toISOString().split('T')[0],
+      occupancy_type: 'single',
       is_active: true
     })).filter(t => t.name && (t.personal_email || t.personal_phone));
     if (tenantsToInsert.length === 0) return res.status(400).json({ error: 'No valid tenants: each tenant needs a name plus an email or phone' });
@@ -393,7 +394,7 @@ app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) =
   try {
     const { tenant_id, amount, payment_date, status } = req.body;
     if (!tenant_id || !amount) return res.status(400).json({ error: 'Tenant and amount required' });
-    const { data, error } = await supabase.from('payments').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, amount: parseFloat(amount), payment_date: payment_date || new Date().toISOString().split('T')[0], status: status || 'paid' }]).select();
+    const { data, error } = await supabase.from('payments').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, amount: parseFloat(amount), payment_date: payment_date || new Date().toISOString().split('T')[0], payment_type: 'rent', payment_method: 'upi', status: status || 'paid' }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -440,20 +441,6 @@ app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken,
     const { data, error } = await supabase.from('maintenance_costs').update({ status }).eq('id', req.params.maintenanceId).eq('user_id', req.userId).select();
     if (error) throw error;
     res.json(data[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// TEMPORARY: raw table probe for schema audit; remove after audit
-app.post('/api/debug/probe', verifyToken, async (req, res) => {
-  try {
-    const { table, action, payload, match } = req.body;
-    let out;
-    if (action === 'insert') out = await supabase.from(table).insert([payload]).select();
-    else if (action === 'delete') out = await supabase.from(table).delete().match(match).select();
-    else out = await supabase.from(table).select('*').limit(1);
-    res.json({ data: out.data, error: out.error });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
