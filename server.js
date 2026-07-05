@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.5-tenant-payment-defaults',
+    version: 'MVP2.6-smart-extraction',
     time: new Date().toISOString() 
   });
 });
@@ -216,68 +216,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
   }
 }
 
-const parsePropertyFromText = (text) => {
-  if (!text) text = '';
-  
-  let city = 'Bengaluru';
-  let state = 'Karnataka';
-  let pincode = '560000';
-  let address = '';
-  let propertyName = 'Property';
-  let propertyType = 'residential';
-  
-  const cityMatch = text.match(/(?:bengaluru|bangalore|mumbai|delhi|pune|hyderabad|chennai|kolkata)/i);
-  if (cityMatch) city = cityMatch[0];
-  
-  const stateMatch = text.match(/(?:karnataka|maharashtra|delhi|tamilnadu|telangana|punjab|haryana|uttar\s+pradesh|rajasthan|gujarat|west\s+bengal)/i);
-  if (stateMatch) state = stateMatch[0];
-  
-  const pincodeMatch = text.match(/\b[0-9]{6}\b/);
-  if (pincodeMatch) pincode = pincodeMatch[0];
-  
-  const addressMatch = text.match(/(?:flat|wing|unit|address)[\s#:]*([A-Za-z0-9\s,\-\.]+?)(?:\n|,\s*[0-9]{6}|$)/i);
-  if (addressMatch) address = addressMatch[1].trim().substring(0, 100);
-  
-  if (address) propertyName = address.substring(0, 50);
-  else propertyName = `${city} Property`;
-  
-  if (text.toLowerCase().includes('commercial')) propertyType = 'commercial';
-  
-  return { 
-    property_name: propertyName || 'Property', 
-    street_address: address || '10 Street, Block A',
-    city: city || 'Bengaluru',
-    state: state || 'Karnataka',
-    pincode: pincode || '560000',
-    property_type: propertyType 
-  };
-};
-
-const parseTenantsFromText = (text) => {
-  const emails = [...new Set(text.match(/[\w\.\-]+@[\w\.\-]+\.\w+/gi) || [])];
-  const phones = [...new Set(text.match(/(?:\+91)?[\s\-]?[6-9]\d{2}[\s\-]?\d{3}[\s\-]?\d{4}|[6-9]\d{9}/g) || [])];
-  const nameRegex = /(?:tenant|lessee|second party|name)[\s:]*([A-Z][A-Za-z\s]{2,50}?)(?:\n|aadhar|id|email|phone|d\/o|permanent|address)/gi;
-  const names = [];
-  let match;
-  while ((match = nameRegex.exec(text)) !== null) {
-    const name = match[1].trim();
-    if (name.length > 2 && name.length < 50 && !name.match(/^\d+$/)) names.push(name);
-  }
-  const uniqueNames = [...new Set(names)];
-  const maxTenants = Math.max(uniqueNames.length, emails.length, phones.length);
-  const tenants = [];
-  for (let i = 0; i < maxTenants; i++) {
-    if (uniqueNames[i] || emails[i] || phones[i]) {
-      tenants.push({
-        name: uniqueNames[i] || `Tenant ${i + 1}`,
-        personal_email: emails[i] || null,
-        personal_phone: phones[i] || null,
-        date_of_move_in: null
-      });
-    }
-  }
-  return tenants.filter(t => t.personal_email || t.personal_phone);
-};
+const { parsePropertyFromText, parseTenantsFromText } = require('./parsers');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -305,10 +244,9 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
 
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
-    const { name, personal_email, personal_phone, date_of_move_in } = req.body;
+    const { name, personal_email, personal_phone, date_of_move_in, aadhar_card } = req.body;
     if (!name) return res.status(400).json({ error: 'Name required' });
-    if (!personal_email && !personal_phone) return res.status(400).json({ error: 'Email or phone required' });
-    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : '', personal_phone: personal_phone ? personal_phone.trim() : '', date_of_move_in: date_of_move_in || new Date().toISOString().split('T')[0], occupancy_type: 'single', is_active: true }]).select();
+    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : '', personal_phone: personal_phone ? personal_phone.trim() : '', aadhar_card: aadhar_card || null, date_of_move_in: date_of_move_in || new Date().toISOString().split('T')[0], occupancy_type: 'single', is_active: true }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -326,11 +264,12 @@ app.post('/api/properties/:propertyId/tenants/bulk', verifyToken, async (req, re
       name: (t.name || '').trim(),
       personal_email: t.personal_email ? t.personal_email.trim().toLowerCase() : '',
       personal_phone: (t.personal_phone || '').trim(),
+      aadhar_card: t.aadhar_card || null,
       date_of_move_in: t.date_of_move_in || new Date().toISOString().split('T')[0],
       occupancy_type: 'single',
       is_active: true
-    })).filter(t => t.name && (t.personal_email || t.personal_phone));
-    if (tenantsToInsert.length === 0) return res.status(400).json({ error: 'No valid tenants: each tenant needs a name plus an email or phone' });
+    })).filter(t => t.name);
+    if (tenantsToInsert.length === 0) return res.status(400).json({ error: 'No valid tenants: each tenant needs at least a name' });
     const { data, error } = await supabase.from('tenants').insert(tenantsToInsert).select();
     if (error) throw error;
     res.status(201).json({ success: true, count: data.length, tenants: data });
