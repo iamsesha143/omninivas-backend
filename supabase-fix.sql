@@ -15,6 +15,15 @@ ALTER TABLE payments ALTER COLUMN payment_type SET DEFAULT 'rent';
 ALTER TABLE payments ALTER COLUMN payment_type DROP NOT NULL;
 ALTER TABLE payments ALTER COLUMN payment_method DROP NOT NULL;
 
+-- STORAGE: allow the app to upload and list files in the "documents" bucket
+-- (create the bucket first: Storage -> New bucket -> "documents")
+DROP POLICY IF EXISTS "app can upload documents" ON storage.objects;
+DROP POLICY IF EXISTS "app can read documents" ON storage.objects;
+CREATE POLICY "app can upload documents" ON storage.objects
+  FOR INSERT TO anon, authenticated WITH CHECK (bucket_id = 'documents');
+CREATE POLICY "app can read documents" ON storage.objects
+  FOR SELECT TO anon, authenticated USING (bucket_id = 'documents');
+
 -- MAINTENANCE_COSTS: app uses cost_date + status; category/cost_type are optional
 ALTER TABLE maintenance_costs DROP CONSTRAINT IF EXISTS valid_category;
 ALTER TABLE maintenance_costs ADD COLUMN IF NOT EXISTS cost_date DATE DEFAULT CURRENT_DATE;
