@@ -34,7 +34,11 @@ Two-sided (owner + tenant logins). India first, USA second.
   OCR the screenshot for amount / date / UTR; owner one-tap confirm.
 - Auto-generated rent receipts (PDF) — tenants need these for HRA tax claims.
 
-### Phase 2 — Tenant login
+### Phase 2 — Tenant login  ✅ DONE (July 2026, verified in prod)
+- users.role (owner|tenant) in JWT; tenant invite link now includes optional set-password step -> creates tenant login (linked via tenants.login_user_id).
+- Tenant portal (/api/tenant/home): own bills with status, proof upload (OCR), payment history, receipts. Tenants see zero owner data (verified: 0 properties, PATCH blocked by requireOwner).
+- New tenant fields per user request: deposit (amount/date/details/refund), profession/employer, police_verification_status, co_occupants table (name/relationship/age/phone/id). Owner edits via "Deposit & more" panel on tenant cards. Migration: phase3.sql.
+- Mobile decision: PWA-first (user chose); native Expo app deferred until product proven with family users.
 - `role` on users (owner | tenant); tenant invited by owner via link/code tied to tenancy.
 - Tenant portal: my agreement, my dues, payment history, receipts, raise-an-issue.
 - Data isolation: tenant sees only their tenancy. (Requires tightening RLS/storage policies.)
