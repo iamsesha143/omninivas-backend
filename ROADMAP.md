@@ -46,7 +46,14 @@ Two-sided (owner + tenant logins). India first, USA second.
   jobs: (a) payment reminder messages, (b) "forward payment screenshot here" ingestion.
 - `users.whatsapp_webhook_token` column already exists in the DB.
 
-### Phase 4 — Asset & fixtures registry (differentiator)
+### Phase 2b — Assets, vendors, self-service, renewals  ✅ DONE (July 2026, verified in prod)
+- Appliances registry with OCR bill scan (parseApplianceFromText: brand/model/serial/date/warranty), warranty_end auto-computed, warranty-expiry alerts on dashboard.
+- Vendors contact book (plumber/electrician/... shared across properties).
+- Tenant self-service invite: owner generates /invite/:token link, tenant fills own emergency contact/vehicle/etc via public no-auth page.
+- Renewal reminders: property.agreement_start_date + agreement_months → dashboard "Needs your attention" within 60 days.
+- Share-to-app: web app is now an installable PWA (manifest + service worker + icons) with a GET share_target at /share. NOTE: full image-file share-to-app needs device testing + likely POST+service-worker handler or the native app; iOS can't receive web shares at all. Migration: phase2.sql.
+
+### Phase 4 — Asset & fixtures registry (differentiator)  [partially done in 2b above]
 - Per property: appliances (geyser, AC, fridge…) with make, model, serial, purchase date,
   bill photo, warranty end, AMC, service-center phone. OCR bill to auto-fill.
 - Warranty-expiry + service-due reminders.
