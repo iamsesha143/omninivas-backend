@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.2-empty-email-fallback',
+    version: 'MVP2.3-schema-debug',
     time: new Date().toISOString() 
   });
 });
@@ -440,6 +440,18 @@ app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken,
     const { data, error } = await supabase.from('maintenance_costs').update({ status }).eq('id', req.params.maintenanceId).eq('user_id', req.userId).select();
     if (error) throw error;
     res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// TEMPORARY: returns DB schema via PostgREST OpenAPI doc; remove after schema audit
+app.get('/api/debug/schema', verifyToken, async (req, res) => {
+  try {
+    const r = await fetch(`${process.env.SUPABASE_URL}/rest/v1/`, {
+      headers: { apikey: process.env.SUPABASE_KEY, Authorization: `Bearer ${process.env.SUPABASE_KEY}` }
+    });
+    res.json(await r.json());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
