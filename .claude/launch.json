@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "omninivas-web",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "-s", "/Users/vb/Desktop/omninivas-frontend/build", "-l", "4173"],
+      "port": 4173
+    }
+  ]
+}
