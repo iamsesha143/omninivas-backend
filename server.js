@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.1-tenant-phone-optional-email',
+    version: 'MVP2.2-empty-email-fallback',
     time: new Date().toISOString() 
   });
 });
@@ -308,7 +308,7 @@ app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) =>
     const { name, personal_email, personal_phone, date_of_move_in } = req.body;
     if (!name) return res.status(400).json({ error: 'Name required' });
     if (!personal_email && !personal_phone) return res.status(400).json({ error: 'Email or phone required' });
-    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : null, personal_phone: personal_phone ? personal_phone.trim() : '', date_of_move_in: date_of_move_in || null, is_active: true }]).select();
+    const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : '', personal_phone: personal_phone ? personal_phone.trim() : '', date_of_move_in: date_of_move_in || null, is_active: true }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -324,7 +324,7 @@ app.post('/api/properties/:propertyId/tenants/bulk', verifyToken, async (req, re
       property_id: req.params.propertyId,
       user_id: req.userId,
       name: (t.name || '').trim(),
-      personal_email: t.personal_email ? t.personal_email.trim().toLowerCase() : null,
+      personal_email: t.personal_email ? t.personal_email.trim().toLowerCase() : '',
       personal_phone: (t.personal_phone || '').trim(),
       date_of_move_in: t.date_of_move_in || null,
       is_active: true
