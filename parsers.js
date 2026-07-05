@@ -169,4 +169,32 @@ const parseTenantsFromText = (text) => {
   return tenants.filter(t => !t.name.startsWith('Tenant ') || t.personal_email || t.personal_phone);
 };
 
-module.exports = { parsePropertyFromText, parseTenantsFromText };
+// Pulls amount, date, and UTR/reference out of OCR'd payment screenshots (GPay/PhonePe/bank).
+const MONTHS = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+
+const parsePaymentProof = (text) => {
+  if (!text) text = '';
+  const out = { amount: null, date: null, utr: null };
+
+  // Amount: prefer explicit currency markers; take the largest (screenshots often show balance + amount)
+  const amounts = [];
+  for (const m of text.matchAll(/(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)/gi)) {
+    const v = parseFloat(m[1].replace(/,/g, ''));
+    if (v > 0 && v < 10000000) amounts.push(v);
+  }
+  if (amounts.length) out.amount = Math.max(...amounts);
+
+  // UTR / transaction reference
+  const utr = text.match(/(?:utr|ref(?:erence)?\s*(?:no|id)?|transaction\s*id|txn\s*id)[^\w]{0,5}([A-Za-z0-9]{10,25})/i) || text.match(/\b(\d{12})\b/);
+  if (utr) out.utr = utr[1];
+
+  // Date: "5 Mar 2026" / "05/03/2026" styles
+  const d1 = text.match(/\b(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[,\s]+(\d{4})/i);
+  const d2 = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
+  if (d1) out.date = `${d1[3]}-${MONTHS[d1[2].toLowerCase().slice(0, 3)]}-${d1[1].padStart(2, '0')}`;
+  else if (d2) out.date = `${d2[3]}-${d2[2].padStart(2, '0')}-${d2[1].padStart(2, '0')}`;
+
+  return out;
+};
+
+module.exports = { parsePropertyFromText, parseTenantsFromText, parsePaymentProof };

@@ -17,7 +17,7 @@ const os = require('os');
 const app = express();
 
 app.use(cors({
-  origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000'],
+  origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000', 'http://localhost:4173'],
   credentials: true,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.7-secure-auth',
+    version: 'MVP3.0-rent-and-bills',
     time: new Date().toISOString() 
   });
 });
@@ -236,7 +236,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
   }
 }
 
-const { parsePropertyFromText, parseTenantsFromText } = require('./parsers');
+const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof } = require('./parsers');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -351,9 +351,20 @@ app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', ver
 
 app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) => {
   try {
-    const { tenant_id, amount, payment_date, status } = req.body;
-    if (!tenant_id || !amount) return res.status(400).json({ error: 'Tenant and amount required' });
-    const { data, error } = await supabase.from('payments').insert([{ property_id: req.params.propertyId, tenant_id, user_id: req.userId, amount: parseFloat(amount), payment_date: payment_date || new Date().toISOString().split('T')[0], payment_type: 'rent', payment_method: 'upi', status: status || 'paid' }]).select();
+    const { tenant_id, amount, payment_date, status, obligation_id, period } = req.body;
+    if (!amount || (!tenant_id && !obligation_id)) return res.status(400).json({ error: 'Amount plus a tenant or an obligation required' });
+    const { data, error } = await supabase.from('payments').insert([{
+      property_id: req.params.propertyId,
+      tenant_id: tenant_id || null,
+      user_id: req.userId,
+      obligation_id: obligation_id || null,
+      period: /^\d{4}-\d{2}$/.test(period || '') ? `${period}-01` : null,
+      amount: parseFloat(amount),
+      payment_date: payment_date || new Date().toISOString().split('T')[0],
+      payment_type: 'rent',
+      payment_method: 'upi',
+      status: status || 'paid'
+    }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -405,15 +416,208 @@ app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken,
   }
 });
 
+// ===== PHASE 1: RENT & BILLS (obligations = recurring dues per property) =====
+
+app.post('/api/properties/:propertyId/obligations', verifyToken, async (req, res) => {
+  try {
+    const { type, label, amount, due_day, paid_by } = req.body;
+    if (!label) return res.status(400).json({ error: 'Label required (e.g. Rent, Electricity)' });
+    if (paid_by && !['owner', 'tenant'].includes(paid_by)) return res.status(400).json({ error: 'paid_by must be owner or tenant' });
+    const day = parseInt(due_day, 10);
+    const { data, error } = await supabase.from('obligations').insert([{
+      property_id: req.params.propertyId,
+      user_id: req.userId,
+      type: type || 'other',
+      label: label.trim(),
+      amount: amount ? parseFloat(amount) : null,
+      due_day: (day >= 1 && day <= 31) ? day : 5,
+      paid_by: paid_by || 'tenant',
+      active: true
+    }]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/properties/:propertyId/obligations', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('obligations').select('*')
+      .eq('property_id', req.params.propertyId).eq('user_id', req.userId).eq('active', true)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/obligations/:id', verifyToken, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['label', 'amount', 'due_day', 'paid_by', 'type', 'active']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { data, error } = await supabase.from('obligations').update(allowed)
+      .eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Dues for a month: each active obligation with its payment status (paid / pending / due / overdue)
+app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
+  try {
+    const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : new Date().toISOString().slice(0, 7);
+    const period = `${month}-01`;
+    const [{ data: obligations, error: e1 }, { data: payments, error: e2 }] = await Promise.all([
+      supabase.from('obligations').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).eq('active', true),
+      supabase.from('payments').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).eq('period', period)
+    ]);
+    if (e1) throw e1;
+    if (e2) throw e2;
+    const today = new Date().toISOString().slice(0, 10);
+    const items = (obligations || []).map(o => {
+      const payment = (payments || []).find(p => p.obligation_id === o.id && p.status !== 'rejected') || null;
+      const lastDay = new Date(parseInt(month.slice(0, 4)), parseInt(month.slice(5, 7)), 0).getDate();
+      const dueDate = `${month}-${String(Math.min(o.due_day, lastDay)).padStart(2, '0')}`;
+      let status = 'due';
+      if (payment && payment.status === 'paid') status = 'paid';
+      else if (payment) status = 'pending_confirmation';
+      else if (dueDate < today) status = 'overdue';
+      return { obligation: o, payment, status, due_date: dueDate };
+    });
+    res.json({ month, items });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Upload payment proof (screenshot/PDF): stores file, OCRs amount/date/UTR, creates a pending payment
+app.post('/api/properties/:propertyId/obligations/:obligationId/proof', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const month = /^\d{4}-\d{2}$/.test(req.body.month || '') ? req.body.month : new Date().toISOString().slice(0, 7);
+    const { data: obligation, error: oErr } = await supabase.from('obligations').select('*')
+      .eq('id', req.params.obligationId).eq('user_id', req.userId).single();
+    if (oErr || !obligation) return res.status(404).json({ error: 'Obligation not found' });
+
+    const fileName = `proofs/${req.params.propertyId}/${req.params.obligationId}_${month}_${Date.now()}`;
+    const { error: upErr } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
+
+    let extracted = { amount: null, date: null, utr: null };
+    try {
+      const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
+      extracted = parsePaymentProof(text);
+    } catch (err) {
+      console.warn('Proof OCR failed (keeping upload):', err.message);
+    }
+
+    const { data, error } = await supabase.from('payments').insert([{
+      property_id: req.params.propertyId,
+      user_id: req.userId,
+      obligation_id: obligation.id,
+      tenant_id: req.body.tenant_id || null,
+      amount: extracted.amount || obligation.amount || 0,
+      payment_date: extracted.date || new Date().toISOString().slice(0, 10),
+      period: `${month}-01`,
+      status: 'pending',
+      proof_url: fileName,
+      utr_number: extracted.utr || null
+    }]).select();
+    if (error) throw error;
+    res.status(201).json({ payment: data[0], extracted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Confirm or reject a payment (owner reviews the proof)
+app.patch('/api/payments/:id', verifyToken, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['status', 'amount', 'payment_date', 'notes']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { data, error } = await supabase.from('payments').update(allowed)
+      .eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Printable rent receipt (HTML)
+app.get('/api/payments/:id/receipt', verifyToken, async (req, res) => {
+  try {
+    const { data: p, error } = await supabase.from('payments').select('*').eq('id', req.params.id).eq('user_id', req.userId).single();
+    if (error || !p) return res.status(404).json({ error: 'Payment not found' });
+    const [{ data: prop }, { data: owner }, { data: tenant }] = await Promise.all([
+      supabase.from('properties').select('*').eq('id', p.property_id).single(),
+      supabase.from('users').select('full_name,email').eq('id', p.user_id).single(),
+      p.tenant_id ? supabase.from('tenants').select('name').eq('id', p.tenant_id).single() : Promise.resolve({ data: null })
+    ]);
+    const period = p.period ? new Date(p.period).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' }) : '';
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Rent Receipt</title>
+<style>body{font-family:Georgia,serif;max-width:640px;margin:3rem auto;color:#1f2937;padding:0 1rem}
+.box{border:2px solid #1e3a5f;border-radius:8px;padding:2rem}h1{color:#1e3a5f;font-size:1.4rem;border-bottom:2px solid #f97316;padding-bottom:.5rem}
+table{width:100%;margin-top:1rem;border-collapse:collapse}td{padding:.4rem 0;vertical-align:top}td:first-child{color:#6b7280;width:40%}
+.amount{font-size:1.3rem;font-weight:bold;color:#1e3a5f}.foot{margin-top:2rem;font-size:.8rem;color:#6b7280}
+@media print{.noprint{display:none}}</style></head><body>
+<div class="box"><h1>RENT RECEIPT ${period ? '— ' + period : ''}</h1><table>
+<tr><td>Receipt No.</td><td>${p.id.slice(0, 8).toUpperCase()}</td></tr>
+<tr><td>Received from</td><td>${tenant ? tenant.name : '—'}</td></tr>
+<tr><td>Amount</td><td class="amount">₹${Number(p.amount).toLocaleString('en-IN')}</td></tr>
+<tr><td>Towards</td><td>Rent for ${prop ? prop.property_name : ''}${period ? ', ' + period : ''}</td></tr>
+<tr><td>Property</td><td>${prop ? [prop.street_address, prop.city, prop.state, prop.pincode].filter(Boolean).join(', ') : ''}</td></tr>
+<tr><td>Payment date</td><td>${p.payment_date || ''}</td></tr>
+${p.utr_number ? `<tr><td>UTR / Ref</td><td>${p.utr_number}</td></tr>` : ''}
+<tr><td>Received by (Owner)</td><td>${owner ? (owner.full_name || owner.email) : ''}</td></tr>
+</table><p class="foot">Generated by OMniNivas on ${new Date().toLocaleDateString('en-IN')}. This receipt can be used for HRA claims.</p></div>
+<p class="noprint" style="text-align:center;margin-top:1rem"><button onclick="window.print()" style="padding:.6rem 2rem;font-size:1rem;cursor:pointer">Print / Save as PDF</button></p>
+</body></html>`);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/dashboard', verifyToken, async (req, res) => {
   try {
-    const { data: props } = await supabase.from('properties').select('id').eq('user_id', req.userId);
-    const { data: tenants } = await supabase.from('tenants').select('id').eq('user_id', req.userId);
-    const { data: payments } = await supabase.from('payments').select('amount').eq('user_id', req.userId).eq('status', 'paid');
-    const { data: maintenance } = await supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending');
+    const month = new Date().toISOString().slice(0, 7);
+    const period = `${month}-01`;
+    const today = new Date().toISOString().slice(0, 10);
+    const [{ data: props }, { data: tenants }, { data: payments }, { data: maintenance }, { data: obligations }, { data: monthPayments }] = await Promise.all([
+      supabase.from('properties').select('id,property_name').eq('user_id', req.userId),
+      supabase.from('tenants').select('id').eq('user_id', req.userId).eq('is_active', true),
+      supabase.from('payments').select('amount').eq('user_id', req.userId).eq('status', 'paid'),
+      supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending'),
+      supabase.from('obligations').select('*').eq('user_id', req.userId).eq('active', true),
+      supabase.from('payments').select('obligation_id,status').eq('user_id', req.userId).eq('period', period)
+    ]);
     const totalRentPaid = payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
     const pendingMaintenance = maintenance?.reduce((sum, m) => sum + (m.amount || 0), 0) || 0;
-    res.json({ totalProperties: props?.length || 0, totalTenants: tenants?.length || 0, totalRentPaid, pendingMaintenanceCosts: pendingMaintenance });
+    let duesPaid = 0, duesPending = 0, duesOverdue = 0;
+    for (const o of (obligations || [])) {
+      const pay = (monthPayments || []).find(p => p.obligation_id === o.id && p.status !== 'rejected');
+      if (pay && pay.status === 'paid') duesPaid++;
+      else if (pay) duesPending++;
+      else {
+        const dueDate = `${month}-${String(Math.min(o.due_day || 5, 28)).padStart(2, '0')}`;
+        if (dueDate < today) duesOverdue++; else duesPending++;
+      }
+    }
+    res.json({
+      totalProperties: props?.length || 0,
+      totalTenants: tenants?.length || 0,
+      totalRentPaid,
+      pendingMaintenanceCosts: pendingMaintenance,
+      duesThisMonth: { month, total: (obligations || []).length, paid: duesPaid, pending: duesPending, overdue: duesOverdue }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
