@@ -197,4 +197,35 @@ const parsePaymentProof = (text) => {
   return out;
 };
 
-module.exports = { parsePropertyFromText, parseTenantsFromText, parsePaymentProof };
+// Pulls appliance details out of an OCR'd purchase bill / invoice.
+const parseApplianceFromText = (text) => {
+  if (!text) text = '';
+  const out = { brand: null, model: null, serial_number: null, purchase_date: null, warranty_months: null, category: 'other' };
+
+  const BRANDS = ['Bajaj', 'Havells', 'Racold', 'AO Smith', 'V-Guard', 'Crompton', 'Venus', 'Whirlpool', 'LG', 'Samsung', 'Voltas', 'Blue Star', 'Daikin', 'Hitachi', 'Godrej', 'Haier', 'IFB', 'Bosch', 'Panasonic', 'Orient', 'Usha', 'Kenstar', 'Prestige', 'Faber', 'Symphony'];
+  for (const b of BRANDS) {
+    if (new RegExp(`\\b${b.replace(/[-\s]/g, '[-\\s]?')}\\b`, 'i').test(text)) { out.brand = b; break; }
+  }
+
+  const CATS = { geyser: /geyser|water\s*heater/i, ac: /\bair\s*condition|\bA\/?C\b|split\s*ac|inverter\s*ac/i, fridge: /refrigerator|fridge/i, washing_machine: /washing\s*machine/i, fan: /\bfan\b/i };
+  for (const [cat, re] of Object.entries(CATS)) { if (re.test(text)) { out.category = cat; break; } }
+
+  const model = text.match(/(?:model|model\s*no\.?|model\s*name)[\s:.#-]*([A-Za-z0-9\-\/]{3,25})/i);
+  if (model) out.model = model[1];
+  const serial = text.match(/(?:serial|serial\s*no\.?|s\/n|sr\.?\s*no\.?)[\s:.#-]*([A-Za-z0-9\-]{5,25})/i);
+  if (serial) out.serial_number = serial[1];
+
+  const MONTHS = { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' };
+  const d1 = text.match(/\b(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[,\s]+(\d{4})/i);
+  const d2 = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/);
+  if (d1) out.purchase_date = `${d1[3]}-${MONTHS[d1[2].toLowerCase().slice(0, 3)]}-${d1[1].padStart(2, '0')}`;
+  else if (d2) out.purchase_date = `${d2[3]}-${d2[2].padStart(2, '0')}-${d2[1].padStart(2, '0')}`;
+
+  const warr = text.match(/(\d{1,2})\s*(?:year|yr)s?\s*warranty|warranty[\s:]*(\d{1,2})\s*(?:year|yr)/i);
+  if (warr) out.warranty_months = (parseInt(warr[1] || warr[2], 10)) * 12;
+  else { const wm = text.match(/(\d{1,2})\s*months?\s*warranty/i); if (wm) out.warranty_months = parseInt(wm[1], 10); }
+
+  return out;
+};
+
+module.exports = { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText };

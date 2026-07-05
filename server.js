@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP3.0-rent-and-bills',
+    version: 'MVP3.1-assets-vendors-invites-renewals',
     time: new Date().toISOString() 
   });
 });
@@ -147,6 +147,20 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
   }
 });
 
+app.patch('/api/properties/:id', verifyToken, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['property_name', 'street_address', 'city', 'state', 'pincode', 'property_type', 'agreement_start_date', 'agreement_months']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { data, error } = await supabase.from('properties').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function detectFileType(filename, mimetype) {
   const ext = filename.toLowerCase().split('.').pop();
   return {
@@ -236,7 +250,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
   }
 }
 
-const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof } = require('./parsers');
+const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText } = require('./parsers');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -586,6 +600,144 @@ ${p.utr_number ? `<tr><td>UTR / Ref</td><td>${p.utr_number}</td></tr>` : ''}
   }
 });
 
+// ===== PHASE 2: APPLIANCES (asset registry) =====
+
+const addWarrantyEnd = (a) => {
+  if (a.purchase_date && a.warranty_months && !a.warranty_end) {
+    const d = new Date(a.purchase_date);
+    d.setMonth(d.getMonth() + a.warranty_months);
+    a.warranty_end = d.toISOString().slice(0, 10);
+  }
+  delete a.warranty_months;
+  return a;
+};
+
+app.post('/api/properties/:propertyId/appliances', verifyToken, async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b.name) return res.status(400).json({ error: 'Name required (e.g. Geyser - bathroom)' });
+    const row = addWarrantyEnd({
+      property_id: req.params.propertyId, user_id: req.userId,
+      name: b.name.trim(), category: b.category || 'other', brand: b.brand || null,
+      model: b.model || null, serial_number: b.serial_number || null,
+      purchase_date: b.purchase_date || null, warranty_end: b.warranty_end || null,
+      warranty_months: b.warranty_months || null, amc_provider: b.amc_provider || null,
+      service_phone: b.service_phone || null, bill_url: b.bill_url || null, notes: b.notes || null
+    });
+    const { data, error } = await supabase.from('appliances').insert([row]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/properties/:propertyId/appliances', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('appliances').select('*')
+      .eq('property_id', req.params.propertyId).eq('user_id', req.userId).order('created_at', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/appliances/:id', verifyToken, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['name', 'category', 'brand', 'model', 'serial_number', 'purchase_date', 'warranty_end', 'amc_provider', 'service_phone', 'notes']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { data, error } = await supabase.from('appliances').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/appliances/:id', verifyToken, async (req, res) => {
+  try {
+    const { error } = await supabase.from('appliances').delete().eq('id', req.params.id).eq('user_id', req.userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// OCR a purchase bill -> suggested appliance fields (owner reviews before saving)
+app.post('/api/properties/:propertyId/appliances/scan', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const fileName = `appliances/${req.params.propertyId}/bill_${Date.now()}`;
+    await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype }).catch(() => {});
+    let extracted = {};
+    try {
+      const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
+      extracted = parseApplianceFromText(text);
+    } catch (err) { console.warn('Appliance OCR failed:', err.message); }
+    res.json({ extracted, bill_url: fileName });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ===== PHASE 2: VENDORS (reusable contact book across properties) =====
+
+app.post('/api/vendors', verifyToken, async (req, res) => {
+  try {
+    const { name, trade, phone, notes } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    const { data, error } = await supabase.from('vendors').insert([{ user_id: req.userId, name: name.trim(), trade: trade || 'other', phone: phone || null, notes: notes || null }]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/vendors', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('vendors').select('*').eq('user_id', req.userId).order('trade', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/vendors/:id', verifyToken, async (req, res) => {
+  try {
+    const { error } = await supabase.from('vendors').delete().eq('id', req.params.id).eq('user_id', req.userId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ===== PHASE 2: TENANT SELF-SERVICE LINK (tenant fills their own details) =====
+
+app.post('/api/tenants/:tenantId/invite', verifyToken, async (req, res) => {
+  try {
+    const token = crypto.randomBytes(16).toString('hex');
+    const { data, error } = await supabase.from('tenants').update({ share_token: token }).eq('id', req.params.tenantId).eq('user_id', req.userId).select();
+    if (error) throw error;
+    if (!data.length) return res.status(404).json({ error: 'Tenant not found' });
+    res.json({ share_token: token });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUBLIC (no auth): tenant opens their invite link
+app.get('/api/invite/:token', async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('tenants').select('id,name,personal_phone,personal_email,emergency_contact_name,emergency_contact_phone,emergency_contact_relationship,permanent_address,vehicle_number,alternate_phone').eq('share_token', req.params.token).single();
+    if (error || !data) return res.status(404).json({ error: 'Invalid or expired link' });
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUBLIC (no auth): tenant submits their own details
+app.post('/api/invite/:token', async (req, res) => {
+  try {
+    const { data: tenant, error: e0 } = await supabase.from('tenants').select('id').eq('share_token', req.params.token).single();
+    if (e0 || !tenant) return res.status(404).json({ error: 'Invalid or expired link' });
+    const allowed = {};
+    for (const k of ['personal_phone', 'personal_email', 'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relationship', 'permanent_address', 'vehicle_number', 'alternate_phone']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { error } = await supabase.from('tenants').update(allowed).eq('id', tenant.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/dashboard', verifyToken, async (req, res) => {
   try {
     const month = new Date().toISOString().slice(0, 7);
@@ -611,12 +763,33 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
         if (dueDate < today) duesOverdue++; else duesPending++;
       }
     }
+    // Reminders: agreement renewals (within 60 days) and warranties expiring (within 30 days)
+    const [{ data: fullProps }, { data: appliances }] = await Promise.all([
+      supabase.from('properties').select('id,property_name,agreement_start_date,agreement_months').eq('user_id', req.userId),
+      supabase.from('appliances').select('name,warranty_end,property_id').eq('user_id', req.userId).not('warranty_end', 'is', null)
+    ]);
+    const now = new Date();
+    const daysUntil = (d) => Math.ceil((new Date(d) - now) / 86400000);
+    const renewals = [];
+    for (const p of (fullProps || [])) {
+      if (!p.agreement_start_date) continue;
+      const end = new Date(p.agreement_start_date);
+      end.setMonth(end.getMonth() + (p.agreement_months || 11));
+      const days = daysUntil(end.toISOString().slice(0, 10));
+      if (days <= 60) renewals.push({ property: p.property_name, expires_on: end.toISOString().slice(0, 10), days_left: days });
+    }
+    const warranties = (appliances || [])
+      .map(a => ({ name: a.name, warranty_end: a.warranty_end, days_left: daysUntil(a.warranty_end) }))
+      .filter(a => a.days_left <= 30);
+
     res.json({
       totalProperties: props?.length || 0,
       totalTenants: tenants?.length || 0,
       totalRentPaid,
       pendingMaintenanceCosts: pendingMaintenance,
-      duesThisMonth: { month, total: (obligations || []).length, paid: duesPaid, pending: duesPending, overdue: duesOverdue }
+      duesThisMonth: { month, total: (obligations || []).length, paid: duesPaid, pending: duesPending, overdue: duesOverdue },
+      renewals: renewals.sort((a, b) => a.days_left - b.days_left),
+      warrantyAlerts: warranties.sort((a, b) => a.days_left - b.days_left)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
