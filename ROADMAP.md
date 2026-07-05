@@ -25,7 +25,7 @@ Two-sided (owner + tenant logins). India first, USA second.
 
 ## Build phases (in order — each shippable alone)
 
-### Phase 1 — Money truth (rent + recurring bills)  ← NEXT
+### Phase 1 — Money truth (rent + recurring bills)  ✅ DONE (July 2026, verified in prod)
 - `obligations` model per property: rent / electricity / water / society-maintenance /
   other, each with amount (or "variable"), due-day, who-pays (owner | tenant | split %).
   Handles the real case: owner pays society maintenance on some flats, tenant on others.
