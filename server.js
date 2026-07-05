@@ -51,7 +51,7 @@ const verifyToken = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    version: 'MVP2.6-smart-extraction',
+    version: 'MVP2.7-secure-auth',
     time: new Date().toISOString() 
   });
 });
@@ -60,9 +60,19 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, full_name, phone_number } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-    await bcrypt.hash(password, 10);
-    const { data, error } = await supabase.from('users').insert([{ email, full_name, phone_number, whatsapp_webhook_token: crypto.randomBytes(16).toString('hex') }]).select();
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const { data: existing } = await supabase.from('users').select('id').eq('email', email.trim().toLowerCase()).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'An account with this email already exists' });
+    const password_hash = await bcrypt.hash(password, 10);
+    const row = { email: email.trim().toLowerCase(), full_name, phone_number, password_hash, whatsapp_webhook_token: crypto.randomBytes(16).toString('hex') };
+    let { data, error } = await supabase.from('users').insert([row]).select();
+    if (error && /password_hash/i.test(error.message || '')) {
+      // users table predates the password_hash column; keep registration working until the migration runs
+      delete row.password_hash;
+      ({ data, error } = await supabase.from('users').insert([row]).select());
+    }
     if (error) throw error;
+    delete data[0].password_hash;
     const token = jwt.sign({ sub: data[0].id, email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ user: data[0], token });
   } catch (err) {
@@ -73,8 +83,18 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const { data, error } = await supabase.from('users').select('*').eq('email', email).single();
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    const { data, error } = await supabase.from('users').select('*').eq('email', email.trim().toLowerCase()).single();
     if (error || !data) return res.status(401).json({ error: 'Invalid credentials' });
+    if (data.password_hash) {
+      const ok = await bcrypt.compare(password, data.password_hash);
+      if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    } else {
+      // Account created before password storage existed: adopt this password on first login
+      const password_hash = await bcrypt.hash(password, 10);
+      await supabase.from('users').update({ password_hash }).eq('id', data.id);
+    }
+    delete data.password_hash;
     const token = jwt.sign({ sub: data.id, email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ user: data, token });
   } catch (err) {

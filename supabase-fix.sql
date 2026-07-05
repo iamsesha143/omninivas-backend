@@ -3,6 +3,9 @@
 -- Run this ONCE in Supabase: Dashboard -> SQL Editor -> New query -> paste -> Run.
 -- Safe to run multiple times.
 
+-- USERS: store password hashes so logins are actually verified
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+
 -- TENANTS: app allows tenants with phone only, and move-in date is optional
 ALTER TABLE tenants ALTER COLUMN personal_email DROP NOT NULL;
 ALTER TABLE tenants ALTER COLUMN date_of_move_in DROP NOT NULL;
