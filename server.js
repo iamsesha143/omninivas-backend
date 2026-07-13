@@ -34,7 +34,11 @@ const supabase = createClient(
   { realtime: { transport: ws } }
 );
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-key';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is not set. Server will not start.');
+  process.exit(1);
+}
 
 const verifyToken = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
