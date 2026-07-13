@@ -184,7 +184,7 @@ function detectFileType(filename, mimetype) {
 async function tryPDFTextExtraction(buffer) {
   try {
     const uint8Array = new Uint8Array(buffer);
-    const pdf = await pdfjsLib.getDocument({data: uint8Array}).promise;
+    const pdf = await pdfjsLib.getDocument({data: uint8Array, isEvalSupported: false}).promise;
     let totalText = '';
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
       const page = await pdf.getPage(pageNum);
