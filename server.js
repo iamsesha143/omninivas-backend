@@ -17,6 +17,8 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 
+app.set('trust proxy', 1);
+
 app.use(cors({
   origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000', 'http://localhost:4173'],
   credentials: true,
