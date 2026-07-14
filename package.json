@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
+    "@upstash/redis": "^1.38.0",
     "bcryptjs": "^2.4.3",
     "canvas": "^3.2.3",
     "cors": "^2.8.5",
@@ -21,6 +22,7 @@
     "jsonwebtoken": "^9.0.0",
     "multer": "^2.2.0",
     "pdfjs-dist": "^3.11.174",
+    "rate-limit-redis": "^5.0.0",
     "sharp": "^0.35.2",
     "tesseract.js": "^7.0.0",
     "ws": "^8.21.0"

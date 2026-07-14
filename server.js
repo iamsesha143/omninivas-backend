@@ -14,6 +14,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const rateLimit = require('express-rate-limit');
+const { RedisStore } = require('rate-limit-redis');
+const { Redis } = require('@upstash/redis');
 
 const app = express();
 
@@ -29,11 +31,36 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+let makeRedisStore = null;
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  const redis = Redis.fromEnv();
+  // rate-limit-redis's RedisStore issues raw commands (SCRIPT LOAD / EVALSHA / DECR / DEL)
+  // for atomic increments. @upstash/redis has no generic passthrough, so this adapts
+  // those raw commands onto its typed methods.
+  const sendCommand = async (...args) => {
+    const [cmd, ...rest] = args;
+    const command = cmd.toUpperCase();
+    if (command === 'SCRIPT' && (rest[0] || '').toUpperCase() === 'LOAD') return redis.scriptLoad(rest[1]);
+    if (command === 'EVALSHA') {
+      const [sha, numKeysStr, ...keysAndArgs] = rest;
+      const numKeys = parseInt(numKeysStr, 10);
+      return redis.evalsha(sha, keysAndArgs.slice(0, numKeys), keysAndArgs.slice(numKeys));
+    }
+    if (command === 'DECR') return redis.decr(rest[0]);
+    if (command === 'DEL') return redis.del(...rest);
+    throw new Error(`Unsupported command for Upstash rate-limit adapter: ${command}`);
+  };
+  makeRedisStore = (prefix) => new RedisStore({ sendCommand, prefix });
+} else {
+  console.warn('UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN not set - rate limiting will use in-memory store (not shared across instances)');
+}
+
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
+  ...(makeRedisStore ? { store: makeRedisStore('rl:global:') } : {}),
 });
 app.use(globalLimiter);
 
@@ -42,6 +69,7 @@ const authLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  ...(makeRedisStore ? { store: makeRedisStore('rl:auth:') } : {}),
   handler: (req, res) => {
     res.status(429).json({ error: 'Too many login attempts. Please try again in 15 minutes.' });
   },
