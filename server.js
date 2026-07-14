@@ -14,7 +14,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const rateLimit = require('express-rate-limit');
-const { RedisStore } = require('rate-limit-redis');
 const { Redis } = require('@upstash/redis');
 
 const app = express();
@@ -31,26 +30,50 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Custom express-rate-limit Store backed by Upstash, using only plain
+// commands (incr/pexpire/pttl/decr/del) - no Lua/EVALSHA, which behaved
+// inconsistently when proxied through Upstash's REST API in testing.
+class UpstashRateLimitStore {
+  constructor(redis, prefix) {
+    this.redis = redis;
+    this.prefix = prefix;
+    this.localKeys = false;
+  }
+  init(options) {
+    this.windowMs = options.windowMs;
+  }
+  prefixKey(key) {
+    return `${this.prefix}${key}`;
+  }
+  async increment(key) {
+    const redisKey = this.prefixKey(key);
+    const totalHits = await this.redis.incr(redisKey);
+    if (totalHits === 1) {
+      await this.redis.pexpire(redisKey, this.windowMs);
+    }
+    const ttl = await this.redis.pttl(redisKey);
+    const resetTime = new Date(Date.now() + (ttl > 0 ? ttl : this.windowMs));
+    return { totalHits, resetTime };
+  }
+  async decrement(key) {
+    await this.redis.decr(this.prefixKey(key));
+  }
+  async resetKey(key) {
+    await this.redis.del(this.prefixKey(key));
+  }
+  async get(key) {
+    const redisKey = this.prefixKey(key);
+    const totalHits = await this.redis.get(redisKey);
+    if (totalHits === null || totalHits === undefined) return void 0;
+    const ttl = await this.redis.pttl(redisKey);
+    return { totalHits: Number(totalHits), resetTime: new Date(Date.now() + Math.max(ttl, 0)) };
+  }
+}
+
 let makeRedisStore = null;
 if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
   const redis = Redis.fromEnv();
-  // rate-limit-redis's RedisStore issues raw commands (SCRIPT LOAD / EVALSHA / DECR / DEL)
-  // for atomic increments. @upstash/redis has no generic passthrough, so this adapts
-  // those raw commands onto its typed methods.
-  const sendCommand = async (...args) => {
-    const [cmd, ...rest] = args;
-    const command = cmd.toUpperCase();
-    if (command === 'SCRIPT' && (rest[0] || '').toUpperCase() === 'LOAD') return redis.scriptLoad(rest[1]);
-    if (command === 'EVALSHA') {
-      const [sha, numKeysStr, ...keysAndArgs] = rest;
-      const numKeys = parseInt(numKeysStr, 10);
-      return redis.evalsha(sha, keysAndArgs.slice(0, numKeys), keysAndArgs.slice(numKeys));
-    }
-    if (command === 'DECR') return redis.decr(rest[0]);
-    if (command === 'DEL') return redis.del(...rest);
-    throw new Error(`Unsupported command for Upstash rate-limit adapter: ${command}`);
-  };
-  makeRedisStore = (prefix) => new RedisStore({ sendCommand, prefix });
+  makeRedisStore = (prefix) => new UpstashRateLimitStore(redis, prefix);
 } else {
   console.warn('UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN not set - rate limiting will use in-memory store (not shared across instances)');
 }
