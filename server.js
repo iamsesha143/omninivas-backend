@@ -74,9 +74,18 @@ let makeRedisStore = null;
 if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
   const redis = Redis.fromEnv();
   makeRedisStore = (prefix) => new UpstashRateLimitStore(redis, prefix);
+  console.log('Rate limiter: using Redis store');
 } else {
-  console.warn('UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN not set - rate limiting will use in-memory store (not shared across instances)');
+  console.warn('Rate limiter: using in-memory store (fallback) - UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN not set');
 }
+
+// Temporary diagnostic: log the resolved client IP (the rate-limit key) per
+// request to /api/auth/* to check whether it's stable across requests from
+// the same real client, given Railway's edge proxy may vary XFF chain depth.
+app.use('/api/auth', (req, res, next) => {
+  console.log(`[ratelimit-debug] req.ip=${req.ip} xff=${req.headers['x-forwarded-for']}`);
+  next();
+});
 
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
