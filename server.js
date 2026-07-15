@@ -18,7 +18,13 @@ const { Redis } = require('@upstash/redis');
 
 const app = express();
 
-app.set('trust proxy', 1);
+// Railway's edge terminates the client connection and adds one X-Forwarded-For
+// entry, then an internal hop forwards to the container as a second, separate
+// connection - so two hops need to be trusted, not one. Traced through
+// proxy-addr's exact algorithm against captured request data: trust proxy = 1
+// resolved req.ip to that unstable internal hop; = 2 resolves correctly to
+// the real, stable client IP.
+app.set('trust proxy', 2);
 
 app.use(cors({
   origin: ['https://omninivas-frontend-production.up.railway.app', 'http://localhost:3000', 'http://localhost:4173'],
@@ -79,24 +85,11 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
   console.warn('Rate limiter: using in-memory store (fallback) - UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN not set');
 }
 
-// Railway's edge network appends its own (rotating, per-internal-node) proxy
-// IP as the last X-Forwarded-For entry; diagnostic logging confirmed the
-// true client IP is consistently the FIRST entry instead. Express's numeric
-// `trust proxy` hop-count was resolving req.ip to that unstable trailing
-// entry, so key rate-limit buckets on the first XFF entry explicitly rather
-// than trusting a fixed hop count.
-const clientIpKeyGenerator = (req) => {
-  const xff = req.headers['x-forwarded-for'];
-  const ip = (xff ? xff.split(',')[0].trim() : null) || req.ip;
-  return rateLimit.ipKeyGenerator(ip);
-};
-
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: clientIpKeyGenerator,
   ...(makeRedisStore ? { store: makeRedisStore('rl:global:') } : {}),
 });
 app.use(globalLimiter);
@@ -106,7 +99,6 @@ const authLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: clientIpKeyGenerator,
   ...(makeRedisStore ? { store: makeRedisStore('rl:auth:') } : {}),
   handler: (req, res) => {
     res.status(429).json({ error: 'Too many login attempts. Please try again in 15 minutes.' });
