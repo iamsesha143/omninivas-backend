@@ -764,6 +764,84 @@ app.post('/api/properties/:propertyId/appliances/scan', verifyToken, upload.sing
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ===== PHASE 4: APPLIANCE/FIXTURE HANDOVER (move-in + move-out) =====
+
+app.post('/api/properties/:propertyId/handover', verifyToken, async (req, res) => {
+  try {
+    const b = req.body;
+    if (!b.tenant_id) return res.status(400).json({ error: 'tenant_id required' });
+    if (!['move_in', 'move_out'].includes(b.type)) return res.status(400).json({ error: "type must be 'move_in' or 'move_out'" });
+    const { data: prop, error: propErr } = await supabase.from('properties').select('id')
+      .eq('id', req.params.propertyId).eq('user_id', req.userId).single();
+    if (propErr || !prop) return res.status(403).json({ error: 'Property not found or not yours' });
+    const row = {
+      property_id: req.params.propertyId, tenant_id: b.tenant_id, user_id: req.userId,
+      type: b.type, conducted_date: b.conducted_date || null, notes: b.notes || null
+    };
+    const { data, error } = await supabase.from('handovers').insert([row]).select();
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/properties/:propertyId/handover', verifyToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('handovers').select('*, handover_items(*)')
+      .eq('property_id', req.params.propertyId).eq('user_id', req.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    const handovers = data || [];
+    for (const h of handovers) {
+      for (const item of (h.handover_items || [])) {
+        if (item.photo_url) {
+          const { data: signed } = await supabase.storage.from('documents').createSignedUrl(item.photo_url, 3600);
+          item.photo_signed_url = signed?.signedUrl || null;
+        }
+      }
+    }
+    res.json(handovers);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/handover/:id/items', verifyToken, upload.single('photo'), async (req, res) => {
+  try {
+    const { data: handover, error: hErr } = await supabase.from('handovers').select('id, property_id')
+      .eq('id', req.params.id).eq('user_id', req.userId).single();
+    if (hErr || !handover) return res.status(404).json({ error: 'Handover not found' });
+    const b = req.body;
+    if (!b.item_name) return res.status(400).json({ error: 'item_name required' });
+    let photo_url = null;
+    if (req.file) {
+      photo_url = `handover/${handover.property_id}/${handover.id}/${Date.now()}`;
+      await supabase.storage.from('documents').upload(photo_url, req.file.buffer, { contentType: req.file.mimetype }).catch(() => {});
+    }
+    const row = {
+      handover_id: handover.id, appliance_id: b.appliance_id || null,
+      item_name: b.item_name.trim(), condition: b.condition || 'good',
+      photo_url, notes: b.notes || null
+    };
+    const { data, error } = await supabase.from('handover_items').insert([row]).select();
+    if (error) throw error;
+    const item = data[0];
+    if (item.photo_url) {
+      const { data: signed } = await supabase.storage.from('documents').createSignedUrl(item.photo_url, 3600);
+      item.photo_signed_url = signed?.signedUrl || null;
+    }
+    res.status(201).json(item);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/handover/:id', verifyToken, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['status', 'notes', 'conducted_date']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    const { data, error } = await supabase.from('handovers').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ===== PHASE 2: VENDORS (reusable contact book across properties) =====
 
 app.post('/api/vendors', verifyToken, async (req, res) => {
