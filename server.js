@@ -192,25 +192,6 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// Works for both owner and tenant logins — both are rows in `users`, distinguished by `role`.
-app.get('/api/auth/me', verifyToken, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('users').select('id, email, full_name, role, email_enabled').eq('id', req.userId).single();
-    if (error || !data) return res.status(404).json({ error: 'User not found' });
-    res.json(data);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
-  try {
-    const allowed = {};
-    if (req.body.email_enabled !== undefined) allowed.email_enabled = req.body.email_enabled;
-    const { data, error } = await supabase.from('users').update(allowed).eq('id', req.userId).select('id, email, full_name, role, email_enabled');
-    if (error) throw error;
-    res.json(data[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, city, state, street_address, pincode, property_type } = req.body;
@@ -592,9 +573,6 @@ app.patch('/api/obligations/:id', verifyToken, async (req, res) => {
 });
 
 // Dues for a month: each active obligation with its payment status (paid / pending / due / overdue)
-// TODO(Phase 3b): once a scheduled-job mechanism exists (none does today — no
-// cron/queue infra in this codebase), wire notifications.rentDueReminderEmail()
-// here for 'due'/'overdue' rows. Template already exists in notifications.js.
 app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
   try {
     const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : new Date().toISOString().slice(0, 7);
@@ -788,45 +766,6 @@ app.post('/api/properties/:propertyId/appliances/scan', verifyToken, upload.sing
 
 // ===== PHASE 4: APPLIANCE/FIXTURE HANDOVER (move-in + move-out) =====
 
-const notifications = require('./notifications');
-
-// Best-effort email fan-out for handover events — never throws into the route;
-// callers fire-and-forget these (`.catch(() => {})`) so a mail failure can never
-// fail the request that triggered it.
-async function notifyHandoverCreated(handover) {
-  const [{ data: prop }, { data: tenant }, { data: owner }] = await Promise.all([
-    supabase.from('properties').select('property_name').eq('id', handover.property_id).single(),
-    supabase.from('tenants').select('name, personal_email, login_user_id').eq('id', handover.tenant_id).single(),
-    supabase.from('users').select('email, email_enabled').eq('id', handover.user_id).single()
-  ]);
-  if (!prop || !tenant) return;
-  const body = notifications.handoverCreatedEmail({ tenantName: tenant.name, propertyName: prop.property_name });
-  if (tenant.personal_email && await notifications.getTenantEmailPreference(tenant)) {
-    await notifications.sendEmail({ to: tenant.personal_email, ...body });
-  }
-  if (owner && owner.email && owner.email_enabled !== false) {
-    await notifications.sendEmail({ to: owner.email, ...body });
-  }
-}
-
-async function notifyHandoverCompleted(handover) {
-  const [{ data: prop }, { data: tenant }, { data: owner }] = await Promise.all([
-    supabase.from('properties').select('property_name').eq('id', handover.property_id).single(),
-    supabase.from('tenants').select('name, personal_email, login_user_id').eq('id', handover.tenant_id).single(),
-    supabase.from('users').select('email, email_enabled').eq('id', handover.user_id).single()
-  ]);
-  if (!prop || !tenant) return;
-  const tenantOk = tenant.personal_email && await notifications.getTenantEmailPreference(tenant);
-  if (handover.type === 'move_in') {
-    const body = notifications.handoverCompletedEmail({ tenantName: tenant.name, propertyName: prop.property_name });
-    if (tenantOk) await notifications.sendEmail({ to: tenant.personal_email, ...body });
-  } else if (handover.type === 'move_out') {
-    const body = notifications.moveOutCompletedEmail({ tenantName: tenant.name, propertyName: prop.property_name });
-    if (tenantOk) await notifications.sendEmail({ to: tenant.personal_email, ...body });
-    if (owner && owner.email && owner.email_enabled !== false) await notifications.sendEmail({ to: owner.email, ...body });
-  }
-}
-
 app.post('/api/properties/:propertyId/handover', verifyToken, async (req, res) => {
   try {
     const b = req.body;
@@ -841,9 +780,7 @@ app.post('/api/properties/:propertyId/handover', verifyToken, async (req, res) =
     };
     const { data, error } = await supabase.from('handovers').insert([row]).select();
     if (error) throw error;
-    const created = data[0];
-    if (created.type === 'move_in') notifyHandoverCreated(created).catch(() => {});
-    res.status(201).json(created);
+    res.status(201).json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -901,9 +838,7 @@ app.patch('/api/handover/:id', verifyToken, async (req, res) => {
     }
     const { data, error } = await supabase.from('handovers').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;
-    const updated = data[0];
-    if (allowed.status === 'completed' && updated.status === 'completed') notifyHandoverCompleted(updated).catch(() => {});
-    res.json(updated);
+    res.json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
