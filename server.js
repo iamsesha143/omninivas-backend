@@ -437,7 +437,8 @@ app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.singl
     const fileName = `properties/${req.params.propertyId}/deed_${Date.now()}`;
     const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype, metadata: { user_id: req.userId } });
     if (error) throw error;
-    res.json({ success: true, url: fileName });
+    const { data: signed } = await supabase.storage.from('documents').createSignedUrl(fileName, 3600);
+    res.json({ success: true, url: signed?.signedUrl || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -447,12 +448,12 @@ app.get('/api/properties/:propertyId/documents', verifyToken, async (req, res) =
   try {
     const { data, error } = await supabase.storage.from('documents').list(`properties/${req.params.propertyId}`, { limit: 100, sortBy: { column: 'created_at', order: 'desc' } });
     if (error) throw error;
-    const files = (data || []).map(f => ({
-      name: f.name,
-      created_at: f.created_at,
-      size: f.metadata?.size,
-      url: `properties/${req.params.propertyId}/${f.name}`
-    }));
+    const files = [];
+    for (const f of (data || [])) {
+      const path = `properties/${req.params.propertyId}/${f.name}`;
+      const { data: signed } = await supabase.storage.from('documents').createSignedUrl(path, 3600);
+      files.push({ name: f.name, created_at: f.created_at, size: f.metadata?.size, url: signed?.signedUrl || null });
+    }
     res.json(files);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -466,7 +467,8 @@ app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', ver
     const fileName = `tenants/${req.params.tenantId}/${req.params.docType}_${Date.now()}`;
     const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype, metadata: { user_id: req.userId, tenant_id: req.params.tenantId } });
     if (error) throw error;
-    res.json({ success: true, url: fileName });
+    const { data: signed } = await supabase.storage.from('documents').createSignedUrl(fileName, 3600);
+    res.json({ success: true, url: signed?.signedUrl || null });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -669,10 +671,41 @@ app.patch('/api/payments/:id', verifyToken, async (req, res) => {
     for (const k of ['status', 'amount', 'payment_date', 'notes']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
+    const { data: before, error: beforeErr } = await supabase.from('payments').select('status,amount')
+      .eq('id', req.params.id).eq('user_id', req.userId).single();
+    if (beforeErr || !before) return res.status(404).json({ error: 'Payment not found' });
     const { data, error } = await supabase.from('payments').update(allowed)
       .eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;
+    // Audit trail: log every status/amount edit for deposit/payment dispute evidence.
+    // Never blocks the response -- an audit-write failure shouldn't fail the edit itself.
+    if (allowed.status !== undefined || allowed.amount !== undefined) {
+      await supabase.from('payment_history').insert([{
+        payment_id: req.params.id,
+        changed_by: req.userId,
+        previous_status: before.status,
+        new_status: data[0].status,
+        previous_amount: before.amount,
+        new_amount: data[0].amount,
+        notes: allowed.notes || null
+      }]).catch(() => {});
+    }
     res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Audit trail for a payment's status/amount edits (deposit/payment dispute evidence)
+app.get('/api/payments/:id/history', verifyToken, async (req, res) => {
+  try {
+    const { data: payment } = await supabase.from('payments').select('id')
+      .eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
+    if (!payment) return res.status(404).json({ error: 'Payment not found' });
+    const { data, error } = await supabase.from('payment_history').select('*')
+      .eq('payment_id', req.params.id).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
