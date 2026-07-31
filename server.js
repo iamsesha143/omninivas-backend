@@ -1038,7 +1038,7 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
     const { data: tenant, error } = await supabase.from('tenants').select('*').eq('login_user_id', req.userId).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!tenant) return res.status(404).json({ error: 'No tenancy linked to this login' });
-    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone,agreement_summary').eq('id', tenant.property_id).single();
+    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone,agreement_summary,agreement_start_date,agreement_months').eq('id', tenant.property_id).single();
     const month = new Date().toISOString().slice(0, 7);
     const period = `${month}-01`;
     const [{ data: obligations }, { data: monthPayments }, { data: history }] = await Promise.all([
@@ -1056,9 +1056,17 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
       else if (dueDate < today) status = 'overdue';
       return { obligation: o, payment, status, due_date: dueDate };
     });
+    // Tenant Command Center: lease-end reminder, mirroring the owner dashboard's
+    // renewals calc -- reuses the property row already fetched above, no new query.
+    let leaseEnd = null;
+    if (property?.agreement_start_date) {
+      const end = new Date(property.agreement_start_date);
+      end.setMonth(end.getMonth() + (property.agreement_months || 11));
+      leaseEnd = { date: end.toISOString().slice(0, 10), days_left: Math.ceil((end - new Date()) / 86400000) };
+    }
     res.json({
       tenant: { name: tenant.name, personal_phone: tenant.personal_phone, personal_email: tenant.personal_email, date_of_move_in: tenant.date_of_move_in, deposit_amount: tenant.deposit_amount },
-      property, month, dues, history: history || []
+      property, month, dues, history: history || [], leaseEnd
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
