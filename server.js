@@ -1135,7 +1135,7 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const [{ data: props }, { data: tenants }, { data: payments }, { data: maintenance }, { data: obligations }, { data: monthPayments }] = await Promise.all([
       supabase.from('properties').select('id,property_name').eq('user_id', req.userId),
-      supabase.from('tenants').select('id').eq('user_id', req.userId).eq('is_active', true),
+      supabase.from('tenants').select('id,name,property_id,date_of_move_in,expected_date_of_move_out,actual_date_of_move_out').eq('user_id', req.userId).eq('is_active', true),
       supabase.from('payments').select('amount').eq('user_id', req.userId).eq('status', 'paid'),
       supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending'),
       supabase.from('obligations').select('*').eq('user_id', req.userId).eq('active', true),
@@ -1166,11 +1166,25 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
       const end = new Date(p.agreement_start_date);
       end.setMonth(end.getMonth() + (p.agreement_months || 11));
       const days = daysUntil(end.toISOString().slice(0, 10));
-      if (days <= 60) renewals.push({ property: p.property_name, expires_on: end.toISOString().slice(0, 10), days_left: days });
+      if (days <= 60) renewals.push({ property: p.property_name, property_id: p.id, expires_on: end.toISOString().slice(0, 10), days_left: days });
     }
     const warranties = (appliances || [])
-      .map(a => ({ name: a.name, warranty_end: a.warranty_end, days_left: daysUntil(a.warranty_end) }))
+      .map(a => ({ name: a.name, warranty_end: a.warranty_end, property_id: a.property_id, days_left: daysUntil(a.warranty_end) }))
       .filter(a => a.days_left <= 30);
+
+    // Owner Command Center "Now" panel: upcoming move-in/move-out within 14 days,
+    // reusing the tenants row already fetched above (no extra query).
+    const movements = [];
+    for (const t of (tenants || [])) {
+      if (t.date_of_move_in) {
+        const days = daysUntil(t.date_of_move_in);
+        if (days >= 0 && days <= 14) movements.push({ type: 'move-in', tenant: t.name, property_id: t.property_id, date: t.date_of_move_in, days_left: days });
+      }
+      if (t.expected_date_of_move_out && !t.actual_date_of_move_out) {
+        const days = daysUntil(t.expected_date_of_move_out);
+        if (days <= 14) movements.push({ type: 'move-out', tenant: t.name, property_id: t.property_id, date: t.expected_date_of_move_out, days_left: days });
+      }
+    }
 
     res.json({
       totalProperties: props?.length || 0,
@@ -1179,7 +1193,8 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
       pendingMaintenanceCosts: pendingMaintenance,
       duesThisMonth: { month, total: (obligations || []).length, paid: duesPaid, pending: duesPending, overdue: duesOverdue },
       renewals: renewals.sort((a, b) => a.days_left - b.days_left),
-      warrantyAlerts: warranties.sort((a, b) => a.days_left - b.days_left)
+      warrantyAlerts: warranties.sort((a, b) => a.days_left - b.days_left),
+      movements: movements.sort((a, b) => a.days_left - b.days_left)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
