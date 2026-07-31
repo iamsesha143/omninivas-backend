@@ -683,15 +683,20 @@ app.patch('/api/payments/:id', verifyToken, async (req, res) => {
     // Audit trail: log every status/amount edit for deposit/payment dispute evidence.
     // Never blocks the response -- an audit-write failure shouldn't fail the edit itself.
     if (allowed.status !== undefined || allowed.amount !== undefined) {
-      await supabase.from('payment_history').insert([{
-        payment_id: req.params.id,
-        changed_by: req.userId,
-        previous_status: before.status,
-        new_status: data[0].status,
-        previous_amount: before.amount,
-        new_amount: data[0].amount,
-        notes: allowed.notes || null
-      }]).catch(() => {});
+      // supabase-js query builders are PromiseLike (only .then()), not real
+      // Promises -- .catch() doesn't exist on them directly and throws. await
+      // inside try/catch consumes the thenable correctly instead.
+      try {
+        await supabase.from('payment_history').insert([{
+          payment_id: req.params.id,
+          changed_by: req.userId,
+          previous_status: before.status,
+          new_status: data[0].status,
+          previous_amount: before.amount,
+          new_amount: data[0].amount,
+          notes: allowed.notes || null
+        }]);
+      } catch (_) {}
     }
     res.json(data[0]);
   } catch (err) {
