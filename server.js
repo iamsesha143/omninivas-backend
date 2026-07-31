@@ -213,8 +213,8 @@ app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { property_name, city, state, street_address, pincode, property_type } = req.body;
-    
+    const { property_name, city, state, street_address, pincode, property_type, agreement_summary } = req.body;
+
     if (!property_name || !city || !state || !pincode) {
       return res.status(400).json({ error: 'Property name, city, state, and pincode required' });
     }
@@ -226,7 +226,8 @@ app.post('/api/properties', verifyToken, async (req, res) => {
       state: state.trim(),
       street_address: street_address ? street_address.trim() : '',
       pincode: pincode.trim(),
-      property_type: property_type || 'residential'
+      property_type: property_type || 'residential',
+      agreement_summary: agreement_summary || null
     }]).select();
     
     if (error) throw error;
@@ -360,6 +361,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
 }
 
 const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText } = require('./parsers');
+const { summarizeAgreement } = require('./llm');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -367,7 +369,8 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
     if (!text || text.trim().length < 50) return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     const propertyData = parsePropertyFromText(text);
-    res.json({ success: true, extractedData: propertyData });
+    const { summary } = await summarizeAgreement(text);
+    res.json({ success: true, extractedData: propertyData, agreementSummary: summary });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
@@ -1035,7 +1038,7 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
     const { data: tenant, error } = await supabase.from('tenants').select('*').eq('login_user_id', req.userId).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!tenant) return res.status(404).json({ error: 'No tenancy linked to this login' });
-    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone').eq('id', tenant.property_id).single();
+    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone,agreement_summary').eq('id', tenant.property_id).single();
     const month = new Date().toISOString().slice(0, 7);
     const period = `${month}-01`;
     const [{ data: obligations }, { data: monthPayments }, { data: history }] = await Promise.all([
