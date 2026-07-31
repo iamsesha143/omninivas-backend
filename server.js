@@ -1041,10 +1041,17 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
     const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone,agreement_summary,agreement_start_date,agreement_months').eq('id', tenant.property_id).single();
     const month = new Date().toISOString().slice(0, 7);
     const period = `${month}-01`;
-    const [{ data: obligations }, { data: monthPayments }, { data: history }] = await Promise.all([
+    const [{ data: obligations }, { data: monthPayments }, { data: history }, { data: appliances }, { data: vendors }, { data: moveIn }] = await Promise.all([
       supabase.from('obligations').select('*').eq('property_id', tenant.property_id).eq('active', true).eq('paid_by', 'tenant'),
       supabase.from('payments').select('*').eq('property_id', tenant.property_id).eq('period', period),
-      supabase.from('payments').select('id,amount,payment_date,status,period,obligation_id').eq('property_id', tenant.property_id).order('payment_date', { ascending: false }).limit(24)
+      supabase.from('payments').select('id,amount,payment_date,status,period,obligation_id').eq('property_id', tenant.property_id).order('payment_date', { ascending: false }).limit(24),
+      // Read-only tenant view: appliances/vendors are owner-scoped (user_id), not
+      // tenant-scoped, so filter by tenant.user_id (the landlord) -- safe because
+      // tenant.user_id/property_id both came from the tenant row already matched
+      // to this login above, not from client input.
+      supabase.from('appliances').select('name,category,brand,model,amc_provider,service_phone').eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).order('name', { ascending: true }),
+      supabase.from('vendors').select('name,trade,phone').eq('user_id', tenant.user_id).order('trade', { ascending: true }),
+      supabase.from('handovers').select('*, handover_items(item_name,condition)').eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).eq('type', 'move_in').order('created_at', { ascending: false }).limit(1)
     ]);
     const today = new Date().toISOString().slice(0, 10);
     const dues = (obligations || []).map(o => {
@@ -1065,8 +1072,16 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
       leaseEnd = { date: end.toISOString().slice(0, 10), days_left: Math.ceil((end - new Date()) / 86400000) };
     }
     res.json({
-      tenant: { name: tenant.name, personal_phone: tenant.personal_phone, personal_email: tenant.personal_email, date_of_move_in: tenant.date_of_move_in, deposit_amount: tenant.deposit_amount },
-      property, month, dues, history: history || [], leaseEnd
+      tenant: {
+        name: tenant.name, personal_phone: tenant.personal_phone, personal_email: tenant.personal_email,
+        alternate_phone: tenant.alternate_phone, vehicle_number: tenant.vehicle_number,
+        emergency_contact_name: tenant.emergency_contact_name, emergency_contact_phone: tenant.emergency_contact_phone,
+        emergency_contact_relationship: tenant.emergency_contact_relationship, permanent_address: tenant.permanent_address,
+        date_of_move_in: tenant.date_of_move_in, deposit_amount: tenant.deposit_amount
+      },
+      property, month, dues, history: history || [], leaseEnd,
+      appliances: appliances || [], vendors: vendors || [],
+      moveInItems: moveIn?.[0]?.handover_items || []
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
