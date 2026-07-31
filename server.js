@@ -213,7 +213,7 @@ app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { property_name, city, state, street_address, pincode, property_type, agreement_summary } = req.body;
+    const { property_name, city, state, street_address, pincode, property_type, agreement_summary, deposit_suggested_total } = req.body;
 
     if (!property_name || !city || !state || !pincode) {
       return res.status(400).json({ error: 'Property name, city, state, and pincode required' });
@@ -227,7 +227,11 @@ app.post('/api/properties', verifyToken, async (req, res) => {
       street_address: street_address ? street_address.trim() : '',
       pincode: pincode.trim(),
       property_type: property_type || 'residential',
-      agreement_summary: agreement_summary || null
+      agreement_summary: agreement_summary || null,
+      // Suggestion only -- not yet owner-confirmed. deposit_total stays null until
+      // PATCH /api/properties/:id/deposit is called (Accept or manual Override).
+      deposit_suggested_total: deposit_suggested_total || null,
+      deposit_source: deposit_suggested_total ? 'agreement_ai' : null
     }]).select();
     
     if (error) throw error;
@@ -266,6 +270,40 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
     const { data, error } = await supabase.from('properties').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;
     res.json(data[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Confirm a property's deposit: either accept the previously-suggested agreement_ai
+// total, or set one manually. Either way, splits it equally across the CURRENT
+// active tenant list and writes it to each tenant's existing deposit_amount column
+// -- no new per-tenant column. Re-callable any time to correct/replace the split.
+app.patch('/api/properties/:id/deposit', verifyToken, async (req, res) => {
+  try {
+    const { deposit_total, accept_suggestion } = req.body;
+    const { data: prop } = await supabase.from('properties').select('id,deposit_suggested_total').eq('id', req.params.id).eq('user_id', req.userId).single();
+    if (!prop) return res.status(404).json({ error: 'Property not found' });
+    let total, source;
+    if (accept_suggestion) {
+      if (!prop.deposit_suggested_total) return res.status(400).json({ error: 'No AI-suggested deposit to accept for this property' });
+      total = prop.deposit_suggested_total; source = 'agreement_ai';
+    } else {
+      total = parseFloat(deposit_total);
+      if (!total || total <= 0) return res.status(400).json({ error: 'A positive deposit_total is required' });
+      source = 'manual';
+    }
+    const { data: updated, error } = await supabase.from('properties')
+      .update({ deposit_total: total, deposit_source: source, deposit_confirmed_at: new Date().toISOString() })
+      .eq('id', req.params.id).select().single();
+    if (error) throw error;
+    const { data: tenants } = await supabase.from('tenants').select('id').eq('property_id', req.params.id).eq('is_active', true);
+    const tenantCount = tenants?.length || 0;
+    const perTenant = tenantCount > 0 ? Math.round((total / tenantCount) * 100) / 100 : total;
+    if (tenantCount > 0) {
+      await supabase.from('tenants').update({ deposit_amount: perTenant }).eq('property_id', req.params.id).eq('is_active', true);
+    }
+    res.json({ property: updated, per_tenant: perTenant, tenant_count: tenantCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -361,7 +399,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
 }
 
 const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText } = require('./parsers');
-const { summarizeAgreement } = require('./llm');
+const { summarizeAgreement, extractDeposit, compareMoveInOut } = require('./llm');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -370,7 +408,13 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     if (!text || text.trim().length < 50) return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     const propertyData = parsePropertyFromText(text);
     const { summary } = await summarizeAgreement(text);
-    res.json({ success: true, extractedData: propertyData, agreementSummary: summary });
+    const deposit = await extractDeposit(text);
+    res.json({
+      success: true, extractedData: propertyData, agreementSummary: summary,
+      // skipped=true (missing key, short/unparsable text, or a failed call) simply
+      // means no suggestion -- the frontend falls back to manual-only deposit entry.
+      depositSuggestion: deposit.skipped ? null : { total: deposit.total, tenantCount: deposit.tenantCount }
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
   }
@@ -948,6 +992,47 @@ app.patch('/api/handover/:id', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Owner edits one handover item's deduction (pre-filled from AI accept, manually
+// typed, or left blank to ignore AI entirely). handover_items has no user_id of
+// its own, so ownership is checked via the !inner-joined parent handover's
+// user_id -- PostgREST filters the top-level rows down to only those whose
+// embedded handovers row matches.
+app.patch('/api/handover-items/:id', verifyToken, async (req, res) => {
+  try {
+    const { deduction_amount, deduction_reason } = req.body;
+    const { data: existing } = await supabase.from('handover_items').select('id, handovers!inner(user_id)')
+      .eq('id', req.params.id).eq('handovers.user_id', req.userId).maybeSingle();
+    if (!existing) return res.status(404).json({ error: 'Item not found' });
+    const allowed = {};
+    if (deduction_amount !== undefined) allowed.deduction_amount = deduction_amount === null || deduction_amount === '' ? null : parseFloat(deduction_amount);
+    if (deduction_reason !== undefined) allowed.deduction_reason = deduction_reason || null;
+    const { data, error } = await supabase.from('handover_items').update(allowed).eq('id', req.params.id).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Owner-triggered (no cron infra in this codebase): compares this move_out
+// handover's items against the same tenant's most recent move_in handover and
+// stores the raw AI output on the handover row. Raw ai_summary_json is never
+// returned to tenants (see GET /api/tenant/home) -- only owner-confirmed
+// per-item deduction_amount/reason ever reaches them.
+app.post('/api/handover/:id/ai-review', verifyToken, async (req, res) => {
+  try {
+    const { data: moveOut } = await supabase.from('handovers').select('id,property_id,tenant_id,type,handover_items(item_name,condition,notes)')
+      .eq('id', req.params.id).eq('user_id', req.userId).eq('type', 'move_out').single();
+    if (!moveOut) return res.status(404).json({ error: 'Move-out handover not found' });
+    const { data: moveIns } = await supabase.from('handovers').select('handover_items(item_name,condition,notes)')
+      .eq('property_id', moveOut.property_id).eq('tenant_id', moveOut.tenant_id).eq('user_id', req.userId).eq('type', 'move_in')
+      .order('created_at', { ascending: false }).limit(1);
+    const moveInItems = moveIns?.[0]?.handover_items || [];
+    const result = await compareMoveInOut(moveInItems, moveOut.handover_items || []);
+    if (result.skipped) return res.json({ skipped: true, summary: null });
+    await supabase.from('handovers').update({ ai_summary_json: result.summary, ai_run_at: new Date().toISOString() }).eq('id', req.params.id);
+    res.json({ skipped: false, summary: result.summary });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ===== PHASE 2: VENDORS (reusable contact book across properties) =====
 
 app.post('/api/vendors', verifyToken, async (req, res) => {
@@ -1043,10 +1128,10 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
     const { data: tenant, error } = await supabase.from('tenants').select('*').eq('login_user_id', req.userId).eq('is_active', true).maybeSingle();
     if (error) throw error;
     if (!tenant) return res.status(404).json({ error: 'No tenancy linked to this login' });
-    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone,agreement_summary,agreement_start_date,agreement_months').eq('id', tenant.property_id).single();
+    const { data: property } = await supabase.from('properties').select('property_name,street_address,city,state,pincode,flat_number,society_name,society_contact_name,society_contact_phone,agreement_summary,agreement_start_date,agreement_months,deposit_total,deposit_source,deposit_confirmed_at').eq('id', tenant.property_id).single();
     const month = new Date().toISOString().slice(0, 7);
     const period = `${month}-01`;
-    const [{ data: obligations }, { data: monthPayments }, { data: history }, { data: appliances }, { data: vendors }, { data: moveIn }] = await Promise.all([
+    const [{ data: obligations }, { data: monthPayments }, { data: history }, { data: appliances }, { data: vendors }, { data: moveIn }, { data: moveOut }] = await Promise.all([
       supabase.from('obligations').select('*').eq('property_id', tenant.property_id).eq('active', true).eq('paid_by', 'tenant'),
       supabase.from('payments').select('*').eq('property_id', tenant.property_id).eq('period', period),
       supabase.from('payments').select('id,amount,payment_date,status,period,obligation_id').eq('property_id', tenant.property_id).order('payment_date', { ascending: false }).limit(24),
@@ -1056,7 +1141,11 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
       // to this login above, not from client input.
       supabase.from('appliances').select('name,category,brand,model,amc_provider,service_phone').eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).order('name', { ascending: true }),
       supabase.from('vendors').select('name,trade,phone').eq('user_id', tenant.user_id).order('trade', { ascending: true }),
-      supabase.from('handovers').select('*, handover_items(item_name,condition)').eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).eq('type', 'move_in').order('created_at', { ascending: false }).limit(1)
+      supabase.from('handovers').select('*, handover_items(item_name,condition)').eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).eq('type', 'move_in').order('created_at', { ascending: false }).limit(1),
+      // Only this tenant's own COMPLETED move-out -- deductions are only "owner-
+      // confirmed" once finalized, and only deduction_amount/reason are exposed
+      // here, never ai_summary_json (that stays owner-only, see the handover route).
+      supabase.from('handovers').select('ai_run_at, handover_items(item_name,condition,deduction_amount,deduction_reason)').eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).eq('tenant_id', tenant.id).eq('type', 'move_out').eq('status', 'completed').order('created_at', { ascending: false }).limit(1)
     ]);
     const today = new Date().toISOString().slice(0, 10);
     const dues = (obligations || []).map(o => {
@@ -1086,8 +1175,35 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
       },
       property, month, dues, history: history || [], leaseEnd,
       appliances: appliances || [], vendors: vendors || [],
-      moveInItems: moveIn?.[0]?.handover_items || []
+      moveInItems: moveIn?.[0]?.handover_items || [],
+      moveOutSummary: moveOut?.[0] ? {
+        items: (moveOut[0].handover_items || []).map(it => ({ item_name: it.item_name, condition: it.condition, deduction_amount: it.deduction_amount, deduction_reason: it.deduction_reason })),
+        totalDeduction: (moveOut[0].handover_items || []).reduce((s, it) => s + (Number(it.deduction_amount) || 0), 0),
+        aiAssisted: !!moveOut[0].ai_run_at
+      } : null
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// TENANT: update their own contact/emergency-contact details (self-service,
+// mirrors what the invite-link flow collects). Only the logged-in tenant's own
+// row, matched via login_user_id -- same isolation pattern as GET /api/tenant/home.
+app.patch('/api/tenant/me', verifyToken, async (req, res) => {
+  try {
+    const { data: tenant } = await supabase.from('tenants').select('id').eq('login_user_id', req.userId).eq('is_active', true).maybeSingle();
+    if (!tenant) return res.status(404).json({ error: 'No tenancy linked to this login' });
+    const allowed = {};
+    for (const k of ['personal_phone', 'alternate_phone', 'vehicle_number', 'emergency_contact_name', 'emergency_contact_phone', 'permanent_address']) {
+      if (req.body[k] !== undefined) allowed[k] = (req.body[k] || '').toString().trim();
+    }
+    const phoneOk = (v) => !v || /^[0-9+()\-\s]{7,15}$/.test(v);
+    if (!phoneOk(allowed.personal_phone)) return res.status(400).json({ error: 'Phone number looks invalid' });
+    if (!phoneOk(allowed.alternate_phone)) return res.status(400).json({ error: 'Alternate phone looks invalid' });
+    if (!phoneOk(allowed.emergency_contact_phone)) return res.status(400).json({ error: 'Emergency contact phone looks invalid' });
+    allowed.last_updated_at = new Date().toISOString();
+    const { data, error } = await supabase.from('tenants').update(allowed).eq('id', tenant.id).select();
+    if (error) throw error;
+    res.json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
