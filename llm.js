@@ -93,4 +93,39 @@ async function compareMoveInOut(moveInItems, moveOutItems) {
   }
 }
 
-module.exports = { summarizeAgreement, extractDeposit, compareMoveInOut };
+// WhatsApp import v1: turns a parsed chat's non-system messages into candidate
+// structured facts for owner review. Every fact must carry an evidence snippet
+// and a source message_seq so the frontend can show "why" -- never returned as
+// final truth, only as something to Approve/Edit/Reject.
+const WHATSAPP_CATEGORIES = ['person', 'property_reference', 'payment', 'deposit', 'date_milestone', 'maintenance', 'vendor', 'commitment'];
+
+async function extractWhatsAppFacts(messages) {
+  if (!client || !messages || messages.length === 0) return { skipped: true, facts: [] };
+  try {
+    // Bound cost/tokens: cap message count and total character budget.
+    const capped = messages.slice(0, 400);
+    const payload = capped.map(m => ({ seq: m.seq, sender: m.sender, text: m.body })).filter(m => m.text);
+    const json = JSON.stringify(payload).slice(0, 20000);
+    const message = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: `This is a WhatsApp conversation between an Indian landlord and tenant, as an array of {seq, sender, text}. Extract candidate facts an owner could use to build/enrich their records. Only extract what is explicitly stated -- never infer or guess a number or date that isn't written. Each fact must include the source message's seq and a short verbatim evidence snippet copied from that message's text.\n\nValid categories (use exactly these strings): ${WHATSAPP_CATEGORIES.join(', ')}.\n- person: a named individual and their apparent role (tenant/owner/vendor/other).\n- property_reference: any mention of a flat/unit/address/property name.\n- payment: a stated rent amount or payment confirmation.\n- deposit: a stated security deposit amount or refund mention.\n- date_milestone: a move-in or move-out date.\n- maintenance: a reported issue (e.g. "geyser not working").\n- vendor: a mentioned service person/company (electrician, plumber, etc.) and contact info if given.\n- commitment: a promise or follow-up (e.g. "will pay by 5th", "will send plumber tomorrow").\n\nRespond with ONLY strict JSON, no other text, in exactly this shape: {"facts": [{"category": string, "fact_type": string, "value": string, "confidence": number (0-1), "evidence": string, "message_seq": number}]}. Omit anything not clearly supported by the text -- an empty facts array is a valid answer.\n\nConversation:\n${json}`
+      }]
+    });
+    const block = message.content?.find(b => b.type === 'text');
+    const raw = block?.text?.trim();
+    if (!raw) return { skipped: true, facts: [] };
+    const match = raw.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match ? match[0] : raw);
+    if (!Array.isArray(parsed.facts)) return { skipped: true, facts: [] };
+    const facts = parsed.facts.filter(f => WHATSAPP_CATEGORIES.includes(f.category) && f.value);
+    return { skipped: false, facts };
+  } catch (err) {
+    console.warn('llm.js: extractWhatsAppFacts failed:', err.message);
+    return { skipped: true, facts: [] };
+  }
+}
+
+module.exports = { summarizeAgreement, extractDeposit, compareMoveInOut, extractWhatsAppFacts, WHATSAPP_CATEGORIES };

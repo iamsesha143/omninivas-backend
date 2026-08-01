@@ -1345,6 +1345,125 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
   }
 });
 
+// ===== WHATSAPP IMPORT v1: upload + parse + AI-assisted review, no auto-linking =====
+
+const { parseWhatsAppExport } = require('./whatsapp');
+const { extractWhatsAppFacts } = require('./llm');
+
+// Owner uploads a WhatsApp .txt export. Parses synchronously (no queue/cron infra
+// in this codebase) into whatsapp_messages, then runs AI extraction into
+// whatsapp_extracted_facts. An AI failure/absence only downgrades status to
+// extraction_unavailable -- the parsed timeline is still saved and browsable.
+app.post('/api/whatsapp/import', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const text = req.file.buffer.toString('utf8');
+    if (!text || text.trim().length < 10) return res.status(400).json({ error: 'File looks empty' });
+
+    const propertyId = req.body.property_id || null;
+    if (propertyId) {
+      const { data: prop } = await supabase.from('properties').select('id').eq('id', propertyId).eq('user_id', req.userId).maybeSingle();
+      if (!prop) return res.status(404).json({ error: 'Property not found' });
+    }
+
+    const { data: importRow, error: importErr } = await supabase.from('whatsapp_imports').insert([{
+      user_id: req.userId, property_id: propertyId, file_name: req.file.originalname, status: 'uploaded'
+    }]).select().single();
+    if (importErr) throw importErr;
+
+    let messages;
+    try {
+      messages = parseWhatsAppExport(text);
+    } catch (err) {
+      await supabase.from('whatsapp_imports').update({ status: 'failed', error: 'Could not parse this file' }).eq('id', importRow.id);
+      return res.status(400).json({ error: 'Could not parse this file. Make sure it is a WhatsApp .txt chat export.' });
+    }
+    if (messages.length === 0) {
+      await supabase.from('whatsapp_imports').update({ status: 'failed', error: 'No messages found' }).eq('id', importRow.id);
+      return res.status(400).json({ error: "We couldn't find any WhatsApp messages in this file." });
+    }
+
+    const rows = messages.map(m => ({ import_id: importRow.id, seq: m.seq, ts: m.ts, sender: m.sender, body: m.body, is_system: m.is_system }));
+    await supabase.from('whatsapp_messages').insert(rows);
+    await supabase.from('whatsapp_imports').update({ status: 'parsed', message_count: messages.length }).eq('id', importRow.id);
+
+    const nonSystem = messages.filter(m => !m.is_system);
+    const extraction = await extractWhatsAppFacts(nonSystem);
+    let finalStatus = 'extraction_unavailable';
+    if (!extraction.skipped) {
+      if (extraction.facts.length > 0) {
+        await supabase.from('whatsapp_extracted_facts').insert(extraction.facts.map(f => ({
+          import_id: importRow.id, category: f.category, fact_type: f.fact_type || null,
+          value: String(f.value), confidence: typeof f.confidence === 'number' ? f.confidence : null,
+          evidence: f.evidence || null, message_seq: typeof f.message_seq === 'number' ? f.message_seq : null
+        })));
+      }
+      finalStatus = 'extracted';
+    }
+    const { data: updated } = await supabase.from('whatsapp_imports').update({ status: finalStatus }).eq('id', importRow.id).select().single();
+    res.status(201).json({ import: updated, message_count: messages.length, fact_count: extraction.skipped ? 0 : extraction.facts.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/whatsapp/imports', verifyToken, async (req, res) => {
+  try {
+    let q = supabase.from('whatsapp_imports').select('*').eq('user_id', req.userId).order('created_at', { ascending: false });
+    if (req.query.property_id) q = q.eq('property_id', req.query.property_id);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/whatsapp/imports/:id', verifyToken, async (req, res) => {
+  try {
+    const { data: importRow } = await supabase.from('whatsapp_imports').select('*').eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
+    if (!importRow) return res.status(404).json({ error: 'Import not found' });
+    const [{ data: messages }, { data: facts }] = await Promise.all([
+      supabase.from('whatsapp_messages').select('*').eq('import_id', req.params.id).order('seq', { ascending: true }),
+      supabase.from('whatsapp_extracted_facts').select('*').eq('import_id', req.params.id).order('created_at', { ascending: true })
+    ]);
+    res.json({ import: importRow, messages: messages || [], facts: facts || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Attach/detach an import to a property after the fact (e.g. create the property
+// from the review, then link the import to it).
+app.patch('/api/whatsapp/imports/:id', verifyToken, async (req, res) => {
+  try {
+    const { property_id } = req.body;
+    if (property_id) {
+      const { data: prop } = await supabase.from('properties').select('id').eq('id', property_id).eq('user_id', req.userId).maybeSingle();
+      if (!prop) return res.status(404).json({ error: 'Property not found' });
+    }
+    const { data, error } = await supabase.from('whatsapp_imports').update({ property_id: property_id || null }).eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    if (!data.length) return res.status(404).json({ error: 'Import not found' });
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Owner review action on one extracted fact. This ONLY changes the fact's own
+// status/value -- it never writes to properties/tenants/obligations. Applying an
+// approved fact into core records is intentionally deferred to a later phase.
+app.patch('/api/whatsapp/facts/:id', verifyToken, async (req, res) => {
+  try {
+    const { status, owner_edited_value } = req.body;
+    if (status && !['pending', 'approved', 'edited', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    const { data: existing } = await supabase.from('whatsapp_extracted_facts').select('id, whatsapp_imports!inner(user_id)')
+      .eq('id', req.params.id).eq('whatsapp_imports.user_id', req.userId).maybeSingle();
+    if (!existing) return res.status(404).json({ error: 'Fact not found' });
+    const allowed = {};
+    if (status !== undefined) allowed.status = status;
+    if (owner_edited_value !== undefined) allowed.owner_edited_value = owner_edited_value;
+    const { data, error } = await supabase.from('whatsapp_extracted_facts').update(allowed).eq('id', req.params.id).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }); });
 
 const PORT = process.env.PORT || 3000;
