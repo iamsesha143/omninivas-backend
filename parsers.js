@@ -25,6 +25,17 @@ const titleCase = (s) => s.trim().replace(/\s+/g, ' ')
 
 const cleanSpaces = (s) => s.replace(/\s+/g, ' ').replace(/[\s,.\-–]+$/g, '').trim();
 
+// Some PDF/OCR sources (some PDF generators, and Tesseract on scanned pages with
+// unusual layout) emit a line break after every word instead of real paragraph
+// breaks. That silently breaks any regex anchored on \n as a line boundary (e.g.
+// "name on its own line, then an Aadhaar line below it"). Collapse single line
+// breaks within a paragraph back into spaces while preserving real paragraph
+// breaks (blank lines), so downstream regexes see normal prose either way.
+const normalizeText = (text) => (text || '')
+  .split(/\n{2,}/)
+  .map(para => para.replace(/\n/g, ' ').replace(/[ \t]+/g, ' ').trim())
+  .join('\n\n');
+
 function findCity(text) {
   let best = null;
   for (const city of Object.keys(CITY_TO_STATE)) {
@@ -45,7 +56,7 @@ function findState(text, city) {
 }
 
 const parsePropertyFromText = (text) => {
-  if (!text) text = '';
+  text = normalizeText(text);
 
   // The schedule-property clause ("...premises situated at: <address> - <pincode>")
   // is the most reliable anchor in Indian rental agreements.
@@ -98,6 +109,25 @@ const parsePropertyFromText = (text) => {
 
   if (address && pincode && !address.includes(pincode)) address = `${address} - ${pincode}`;
 
+  // Agreement start date: "effective from 01/03/2026", "commencing from...",
+  // "w.e.f. ...", "lease period from ...". Same date-anchor phrasing tenants
+  // agreements commonly use for move-in, so this mirrors parseTenantsFromText's
+  // own "effective from" regex.
+  let agreementStartDate = null;
+  const startMatch = text.match(/(?:effective|commenc\w*|w\.?e\.?f\.?|lease\s+period)\s*(?:on|from)?\s*[:\s]*(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/i);
+  if (startMatch) {
+    const [, dd, mm, yyyy] = startMatch;
+    agreementStartDate = `${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
+  }
+
+  // Duration: "period of 11 months", "11 (eleven) months", "for 11 months".
+  let agreementMonths = null;
+  const durationMatch = text.match(/(\d{1,2})\s*(?:\([a-z]+\)\s*)?months?/i);
+  if (durationMatch) {
+    const n = parseInt(durationMatch[1], 10);
+    if (n >= 1 && n <= 60) agreementMonths = n;
+  }
+
   return {
     property_name: propertyName.substring(0, 80),
     street_address: address || `${city}`,
@@ -106,11 +136,19 @@ const parsePropertyFromText = (text) => {
     pincode: pincode || '560000',
     property_type: propertyType,
     flat_number: flatNumber,
-    society_name: society
+    society_name: society,
+    agreement_start_date: agreementStartDate,
+    agreement_months: agreementMonths
   };
 };
 
 const parseTenantsFromText = (text) => {
+  // NOT normalized like parsePropertyFromText -- pattern 1 below intentionally
+  // relies on a real single line break between an all-caps name and the
+  // Aadhaar line beneath it; collapsing that would break well-formatted real
+  // documents to "fix" what turned out to be a synthetic-test-PDF artifact
+  // (some PDF generators emit one word per line). Needs a real sample
+  // document to verify/improve tenant-extraction accuracy further.
   if (!text) text = '';
   const emails = [...new Set(text.match(/[\w.\-]+@[\w.\-]+\.\w+/gi) || [])];
   // \b keeps us from matching 10-digit substrings of Aadhaar/certificate numbers

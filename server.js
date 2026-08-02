@@ -213,7 +213,7 @@ app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
 
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { property_name, city, state, street_address, pincode, property_type, agreement_summary, deposit_suggested_total } = req.body;
+    const { property_name, city, state, street_address, pincode, property_type, agreement_summary, deposit_suggested_total, agreement_start_date, agreement_months } = req.body;
 
     if (!property_name || !city || !state || !pincode) {
       return res.status(400).json({ error: 'Property name, city, state, and pincode required' });
@@ -237,7 +237,9 @@ app.post('/api/properties', verifyToken, async (req, res) => {
       // Suggestion only -- not yet owner-confirmed. deposit_total stays null until
       // PATCH /api/properties/:id/deposit is called (Accept or manual Override).
       deposit_suggested_total: deposit_suggested_total || null,
-      deposit_source: deposit_suggested_total ? 'agreement_ai' : null
+      deposit_source: deposit_suggested_total ? 'agreement_ai' : null,
+      agreement_start_date: agreement_start_date || null,
+      agreement_months: agreement_months || 11
     }]).select();
     
     if (error) throw error;
