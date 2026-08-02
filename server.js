@@ -481,7 +481,11 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    const fileName = `properties/${req.params.propertyId}/deed_${Date.now()}`;
+    // The original filename is encoded straight into the storage key (Supabase
+    // Storage's .list() doesn't reliably surface custom upload metadata) so the
+    // listing route below can recover a real title instead of a bare timestamp.
+    const safeName = (req.file.originalname || 'document').replace(/[^a-zA-Z0-9.\-_ ]/g, '_').slice(0, 100);
+    const fileName = `properties/${req.params.propertyId}/deed_${Date.now()}_${safeName}`;
     const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype, metadata: { user_id: req.userId } });
     if (error) throw error;
     const { data: signed } = await supabase.storage.from('documents').createSignedUrl(fileName, 3600);
@@ -499,7 +503,14 @@ app.get('/api/properties/:propertyId/documents', verifyToken, async (req, res) =
     for (const f of (data || [])) {
       const path = `properties/${req.params.propertyId}/${f.name}`;
       const { data: signed } = await supabase.storage.from('documents').createSignedUrl(path, 3600);
-      files.push({ name: f.name, created_at: f.created_at, size: f.metadata?.size, url: signed?.signedUrl || null });
+      // Recover the readable filename encoded into the key at upload time.
+      // Older files (uploaded before this) won't match and fall back to a
+      // plain label rather than showing the raw storage key (a timestamp).
+      const m = f.name.match(/^deed_\d+_(.+)$/);
+      files.push({
+        name: f.name, title: m ? m[1] : 'Property document', type: 'deed',
+        created_at: f.created_at, size: f.metadata?.size, url: signed?.signedUrl || null
+      });
     }
     res.json(files);
   } catch (err) {
