@@ -264,7 +264,7 @@ app.get('/api/properties/:id', verifyToken, async (req, res) => {
 app.patch('/api/properties/:id', verifyToken, async (req, res) => {
   try {
     const allowed = {};
-    for (const k of ['property_name', 'street_address', 'city', 'state', 'pincode', 'property_type', 'agreement_start_date', 'agreement_months']) {
+    for (const k of ['property_name', 'street_address', 'city', 'state', 'pincode', 'flat_number', 'society_name', 'property_type', 'agreement_start_date', 'agreement_months']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { data, error } = await supabase.from('properties').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
@@ -1236,7 +1236,7 @@ app.post('/api/tenant/obligations/:obligationId/proof', verifyToken, upload.sing
 app.patch('/api/tenants/:id', verifyToken, requireOwner, async (req, res) => {
   try {
     const allowed = {};
-    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active']) {
+    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'date_of_move_in', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { data, error } = await supabase.from('tenants').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
@@ -1459,6 +1459,53 @@ app.patch('/api/whatsapp/facts/:id', verifyToken, async (req, res) => {
     if (status !== undefined) allowed.status = status;
     if (owner_edited_value !== undefined) allowed.owner_edited_value = owner_edited_value;
     const { data, error } = await supabase.from('whatsapp_extracted_facts').update(allowed).eq('id', req.params.id).select();
+    if (error) throw error;
+    res.json(data[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// WhatsApp v2: everything the frontend needs to render a fact's apply/diff
+// panel -- the property it could apply to (with current field values), that
+// property's active tenants (for person-link / date targets), and its active
+// obligations (for a payment target). Read-only; no writes happen here.
+app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) => {
+  try {
+    const { data: fact } = await supabase.from('whatsapp_extracted_facts').select('*, whatsapp_imports!inner(user_id, property_id)')
+      .eq('id', req.params.id).eq('whatsapp_imports.user_id', req.userId).maybeSingle();
+    if (!fact) return res.status(404).json({ error: 'Fact not found' });
+    const propertyId = fact.whatsapp_imports.property_id;
+    let property = null, tenants = [], obligations = [];
+    if (propertyId) {
+      const [{ data: p }, { data: t }, { data: o }] = await Promise.all([
+        supabase.from('properties').select('*').eq('id', propertyId).eq('user_id', req.userId).maybeSingle(),
+        supabase.from('tenants').select('id,name,personal_phone,personal_email,permanent_address,date_of_move_in,expected_date_of_move_out').eq('property_id', propertyId).eq('user_id', req.userId).eq('is_active', true),
+        supabase.from('obligations').select('id,label,type,amount,paid_by').eq('property_id', propertyId).eq('user_id', req.userId).eq('active', true)
+      ]);
+      property = p; tenants = t || []; obligations = o || [];
+    }
+    delete fact.whatsapp_imports;
+    res.json({ fact, property, tenants, obligations });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// WhatsApp v2: marks a fact as applied AFTER the frontend has already written
+// the value via the normal existing endpoint (PATCH tenants/properties/
+// properties/:id/deposit/obligations, or POST tenants/maintenance/vendors) --
+// this route performs NO writes to any other table, it is bookkeeping only.
+// Only approved/edited facts are eligible, enforced here too (not just hidden
+// in the UI), and a fact can only be applied once.
+app.patch('/api/whatsapp/facts/:id/apply', verifyToken, async (req, res) => {
+  try {
+    const { applied_to, applied_payload } = req.body;
+    if (!applied_to) return res.status(400).json({ error: 'applied_to is required' });
+    const { data: fact } = await supabase.from('whatsapp_extracted_facts').select('id, status, applied_at, whatsapp_imports!inner(user_id)')
+      .eq('id', req.params.id).eq('whatsapp_imports.user_id', req.userId).maybeSingle();
+    if (!fact) return res.status(404).json({ error: 'Fact not found' });
+    if (!['approved', 'edited'].includes(fact.status)) return res.status(400).json({ error: 'Only approved or edited facts can be applied' });
+    if (fact.applied_at) return res.status(400).json({ error: 'This fact has already been applied' });
+    const { data, error } = await supabase.from('whatsapp_extracted_facts').update({
+      applied_at: new Date().toISOString(), applied_to, applied_payload: applied_payload || null, applied_by: req.userId
+    }).eq('id', req.params.id).select();
     if (error) throw error;
     res.json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
