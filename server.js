@@ -1397,6 +1397,22 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
 // ===== WHATSAPP IMPORT v1: upload + parse + AI-assisted review, no auto-linking =====
 
 const { parseWhatsAppExport } = require('./whatsapp');
+const AdmZip = require('adm-zip');
+
+// Real WhatsApp exports are often a .zip (iOS "with media" and some Android
+// share-sheet paths always zip; media-only text export sometimes doesn't).
+// Finds the chat transcript inside and returns its text -- any media entries
+// inside the zip are read but never stored (out of scope, same as v1: text
+// review only, no photo/video handling).
+function extractChatTextFromZip(buffer) {
+  const zip = new AdmZip(buffer);
+  const entries = zip.getEntries().filter(e => !e.isDirectory && /\.txt$/i.test(e.entryName));
+  if (entries.length === 0) return null;
+  // Prefer an entry that looks like the actual chat transcript (iOS: _chat.txt,
+  // Android: "WhatsApp Chat with X.txt") over any other stray .txt in the zip.
+  const chatEntry = entries.find(e => /chat/i.test(e.entryName)) || entries[0];
+  return chatEntry.getData().toString('utf8');
+}
 const { extractWhatsAppFacts } = require('./llm');
 
 // Owner uploads a WhatsApp .txt export. Parses synchronously (no queue/cron infra
@@ -1406,7 +1422,18 @@ const { extractWhatsAppFacts } = require('./llm');
 app.post('/api/whatsapp/import', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    const text = req.file.buffer.toString('utf8');
+    const isZip = /\.zip$/i.test(req.file.originalname || '') || req.file.mimetype === 'application/zip';
+    let text;
+    if (isZip) {
+      try {
+        text = extractChatTextFromZip(req.file.buffer);
+      } catch (err) {
+        return res.status(400).json({ error: 'Could not open this zip file.' });
+      }
+      if (!text) return res.status(400).json({ error: "This zip doesn't contain a WhatsApp chat text file." });
+    } else {
+      text = req.file.buffer.toString('utf8');
+    }
     if (!text || text.trim().length < 10) return res.status(400).json({ error: 'File looks empty' });
 
     const propertyId = req.body.property_id || null;
