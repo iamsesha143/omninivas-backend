@@ -310,7 +310,7 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
 app.patch('/api/properties/:id/deposit', verifyToken, async (req, res) => {
   try {
     const { deposit_total, accept_suggestion } = req.body;
-    const { data: prop } = await supabase.from('properties').select('id,deposit_suggested_total').eq('id', req.params.id).eq('user_id', req.userId).single();
+    const { data: prop } = await supabase.from('properties').select('id,deposit_suggested_total').eq('id', req.params.id).eq('user_id', req.userId).is('deleted_at', null).single();
     if (!prop) return res.status(404).json({ error: 'Property not found' });
     let total, source;
     if (accept_suggestion) {
@@ -1438,7 +1438,7 @@ app.post('/api/whatsapp/import', verifyToken, upload.single('file'), async (req,
 
     const propertyId = req.body.property_id || null;
     if (propertyId) {
-      const { data: prop } = await supabase.from('properties').select('id').eq('id', propertyId).eq('user_id', req.userId).maybeSingle();
+      const { data: prop } = await supabase.from('properties').select('id').eq('id', propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
       if (!prop) return res.status(404).json({ error: 'Property not found' });
     }
 
@@ -1511,7 +1511,7 @@ app.patch('/api/whatsapp/imports/:id', verifyToken, async (req, res) => {
   try {
     const { property_id } = req.body;
     if (property_id) {
-      const { data: prop } = await supabase.from('properties').select('id').eq('id', property_id).eq('user_id', req.userId).maybeSingle();
+      const { data: prop } = await supabase.from('properties').select('id').eq('id', property_id).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
       if (!prop) return res.status(404).json({ error: 'Property not found' });
     }
     const { data, error } = await supabase.from('whatsapp_imports').update({ property_id: property_id || null }).eq('id', req.params.id).eq('user_id', req.userId).select();
@@ -1553,7 +1553,7 @@ app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) =
     let property = null, tenants = [], obligations = [];
     if (propertyId) {
       const [{ data: p }, { data: t }, { data: o }] = await Promise.all([
-        supabase.from('properties').select('*').eq('id', propertyId).eq('user_id', req.userId).maybeSingle(),
+        supabase.from('properties').select('*').eq('id', propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle(),
         supabase.from('tenants').select('id,name,personal_phone,personal_email,permanent_address,date_of_move_in,expected_date_of_move_out').eq('property_id', propertyId).eq('user_id', req.userId).eq('is_active', true),
         supabase.from('obligations').select('id,label,type,amount,paid_by').eq('property_id', propertyId).eq('user_id', req.userId).eq('active', true)
       ]);
