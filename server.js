@@ -219,6 +219,12 @@ app.post('/api/properties', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Property name, city, state, and pincode required' });
     }
 
+    // Duplicate guard: same owner, same name + pincode, not soft-deleted.
+    const { data: dupe } = await supabase.from('properties').select('id')
+      .eq('user_id', req.userId).is('deleted_at', null)
+      .ilike('property_name', property_name.trim()).eq('pincode', pincode.trim()).maybeSingle();
+    if (dupe) return res.status(409).json({ error: 'A property with this name and pincode already exists' });
+
     const { data, error } = await supabase.from('properties').insert([{
       user_id: req.userId,
       property_name: property_name.trim(),
@@ -243,7 +249,7 @@ app.post('/api/properties', verifyToken, async (req, res) => {
 
 app.get('/api/properties', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('properties').select('*').eq('user_id', req.userId);
+    const { data, error } = await supabase.from('properties').select('*').eq('user_id', req.userId).is('deleted_at', null);
     if (error) throw error;
     res.json(data || []);
   } catch (err) {
@@ -253,9 +259,29 @@ app.get('/api/properties', verifyToken, async (req, res) => {
 
 app.get('/api/properties/:id', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('properties').select('*').eq('id', req.params.id).eq('user_id', req.userId).single();
+    const { data, error } = await supabase.from('properties').select('*').eq('id', req.params.id).eq('user_id', req.userId).is('deleted_at', null).single();
     if (error) throw error;
     res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Safe delete: soft-delete only (deleted_at), never a hard DELETE -- reversible,
+// no cascade risk. Blocked if the property still has active tenants so nobody
+// can lose a live tenancy's context by accident; owner must deactivate tenants
+// first (existing PATCH /api/tenants/:id { is_active:false } flow).
+app.delete('/api/properties/:id', verifyToken, async (req, res) => {
+  try {
+    const { data: prop } = await supabase.from('properties').select('id').eq('id', req.params.id).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+    if (!prop) return res.status(404).json({ error: 'Property not found' });
+    const { data: activeTenants } = await supabase.from('tenants').select('id').eq('property_id', req.params.id).eq('is_active', true).limit(1);
+    if (activeTenants && activeTenants.length > 0) {
+      return res.status(409).json({ error: 'This property still has active tenants. Deactivate or move out all tenants before deleting it.' });
+    }
+    const { error } = await supabase.from('properties').update({ deleted_at: new Date().toISOString() }).eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -481,6 +507,16 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    // Duplicate guard: same filename + same byte size already present for this
+    // property. Cheap and safe -- a real content hash would be more precise but
+    // this catches the actual "uploaded it twice" case without extra deps.
+    const { data: existing } = await supabase.storage.from('documents').list(`properties/${req.params.propertyId}`, { limit: 100 });
+    const dupe = (existing || []).find(f => {
+      const m = f.name.match(/^deed_\d+_(.+)$/);
+      const title = m ? m[1] : null;
+      return title && title.toLowerCase() === (req.file.originalname || '').toLowerCase() && f.metadata?.size === req.file.size;
+    });
+    if (dupe) return res.status(409).json({ error: 'This document appears to already be uploaded for this property.' });
     // The original filename is encoded straight into the storage key (Supabase
     // Storage's .list() doesn't reliably surface custom upload metadata) so the
     // listing route below can recover a real title instead of a bare timestamp.
@@ -1289,7 +1325,7 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
     const period = `${month}-01`;
     const today = new Date().toISOString().slice(0, 10);
     const [{ data: props }, { data: tenants }, { data: payments }, { data: maintenance }, { data: obligations }, { data: monthPayments }] = await Promise.all([
-      supabase.from('properties').select('id,property_name').eq('user_id', req.userId),
+      supabase.from('properties').select('id,property_name').eq('user_id', req.userId).is('deleted_at', null),
       supabase.from('tenants').select('id,name,property_id,date_of_move_in,expected_date_of_move_out,actual_date_of_move_out').eq('user_id', req.userId).eq('is_active', true),
       supabase.from('payments').select('amount').eq('user_id', req.userId).eq('status', 'paid'),
       supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending'),
@@ -1310,7 +1346,7 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
     }
     // Reminders: agreement renewals (within 60 days) and warranties expiring (within 30 days)
     const [{ data: fullProps }, { data: appliances }] = await Promise.all([
-      supabase.from('properties').select('id,property_name,agreement_start_date,agreement_months').eq('user_id', req.userId),
+      supabase.from('properties').select('id,property_name,agreement_start_date,agreement_months').eq('user_id', req.userId).is('deleted_at', null),
       supabase.from('appliances').select('name,warranty_end,property_id').eq('user_id', req.userId).not('warranty_end', 'is', null)
     ]);
     const now = new Date();
