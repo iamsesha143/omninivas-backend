@@ -1027,6 +1027,27 @@ app.post('/api/handover/:id/items', verifyToken, upload.single('photo'), async (
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Smart checklist prefill: bulk-add items in one call (move-in from the
+// property's appliance registry, move-out from the move-in record) so the
+// owner reviews/adjusts condition per row instead of retyping every item name.
+// Text-only, no photos -- photos stay on the existing single-item endpoint.
+app.post('/api/handover/:id/items/bulk', verifyToken, async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items array required' });
+    const { data: handover } = await supabase.from('handovers').select('id').eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
+    if (!handover) return res.status(404).json({ error: 'Handover not found' });
+    const rows = items.filter(i => i.item_name).map(i => ({
+      handover_id: req.params.id, appliance_id: i.appliance_id || null,
+      item_name: String(i.item_name).trim(), condition: i.condition || 'good', notes: i.notes || null
+    }));
+    if (rows.length === 0) return res.status(400).json({ error: 'No valid items' });
+    const { data, error } = await supabase.from('handover_items').insert(rows).select();
+    if (error) throw error;
+    res.status(201).json({ success: true, count: data.length, items: data });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.patch('/api/handover/:id', verifyToken, async (req, res) => {
   try {
     const allowed = {};
