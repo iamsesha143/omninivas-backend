@@ -453,7 +453,11 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
         durationMonths: facts.duration_months,
         maintenancePayer: facts.maintenance_payer,
         electricityPayer: facts.electricity_payer,
-        paintingClause: facts.painting_clause
+        paintingClause: facts.painting_clause,
+        // Fittings/fixtures/appliances explicitly listed in the agreement --
+        // maps to the move-in/appliances/handover area; the review step offers
+        // a one-tap "add these to the appliance registry" action, never silent.
+        fixtures: facts.fixtures || []
       }
     });
   } catch (err) {
@@ -1319,7 +1323,7 @@ app.post('/api/tenant/obligations/:obligationId/proof', verifyToken, upload.sing
 app.patch('/api/tenants/:id', verifyToken, requireOwner, async (req, res) => {
   try {
     const allowed = {};
-    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'date_of_move_in', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active']) {
+    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'date_of_move_in', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active', 'document_log']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { data, error } = await supabase.from('tenants').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
@@ -1644,7 +1648,14 @@ app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) =
     if (propertyId) {
       const [{ data: p }, { data: t }, { data: o }] = await Promise.all([
         supabase.from('properties').select('*').eq('id', propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle(),
-        supabase.from('tenants').select('id,name,personal_phone,personal_email,permanent_address,date_of_move_in,expected_date_of_move_out').eq('property_id', propertyId).eq('user_id', req.userId).eq('is_active', true),
+        // '*' rather than an explicit column list: requesting document_log by
+        // name here errors the ENTIRE query (PostgREST rejects unknown
+        // columns) until migration 013 is applied, and the destructuring
+        // below doesn't check .error, so that failure was silently emptying
+        // the tenants list for every fact type, not just document_reference.
+        // '*' returns whatever columns currently exist either way, and picks
+        // up document_log automatically the moment the migration lands.
+        supabase.from('tenants').select('*').eq('property_id', propertyId).eq('user_id', req.userId).eq('is_active', true),
         supabase.from('obligations').select('id,label,type,amount,paid_by').eq('property_id', propertyId).eq('user_id', req.userId).eq('active', true)
       ]);
       property = p; tenants = t || []; obligations = o || [];

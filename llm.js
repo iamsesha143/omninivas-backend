@@ -6,34 +6,48 @@
 // non-AI behavior. Nothing about server.js needed to change for this.
 const aiGateway = require('./aiGateway');
 
+// Deliberately complementary to extractAgreementFacts() below, not a restatement
+// of it: the structured facts already cover rent/deposit/duration/maintenance
+// payer/electricity payer/painting/fixtures as individually verifiable fields,
+// so this prompt is told to skip repeating those as plain prose and instead
+// surface only what a structured field can't capture -- exceptions, unusual
+// clauses, and practical implications for the owner. Kept short on purpose:
+// this is meant to sit alongside the structured facts, not reproduce the
+// source document.
 async function summarizeAgreement(text) {
   if (!aiGateway.isConfigured() || !text || text.trim().length < 50) return { skipped: true, summary: null };
-  const prompt = `Summarize the key terms of this Indian rental agreement in plain-English bullet points. You MUST explicitly address each of the following, one bullet each, and say "not stated" for any that genuinely aren't in the text -- do not fold several of these into one vague bullet or skip any of them silently:\n- Monthly rent amount\n- Security deposit amount\n- Lease duration / notice period\n- Who pays society maintenance charges (owner or tenant)\n- Who pays electricity charges (owner or tenant)\n- Any painting/whitewashing/one-time charge clause\n- Any other unusual clause worth flagging\n\nOnly state what is explicitly present in the text below -- never infer or guess a detail that isn't there.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
-  const res = await aiGateway.run(prompt, { maxTokens: 500 });
+  const prompt = `You are helping an Indian landlord who will ALSO see these facts already pulled out separately and shown as individual fields: monthly rent, security deposit, lease duration, who pays maintenance, who pays electricity, any painting clause, and any fixtures/appliances listed. Do NOT restate those as plain sentences and do NOT reproduce or paraphrase large chunks of the agreement text.\n\nInstead, in 2-4 short bullet points, surface ONLY things that matter but aren't captured by those simple fields, for example: unusual or one-sided clauses, penalty/lock-in terms, rent escalation clauses, sub-letting restrictions, anything that could surprise the owner or tenant later, or a brief note on the practical implication of a clause. If the agreement is entirely standard with nothing else worth flagging, say so in one line -- do not pad with restatements just to fill space.\n\nOnly state what is explicitly present in the text below -- never infer or guess a detail that isn't there.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
+  const res = await aiGateway.run(prompt, { maxTokens: 350 });
   if (!res.ok) return { skipped: true, summary: null };
   return { skipped: false, summary: res.text };
 }
 
 const EMPTY_AGREEMENT_FACTS = {
   skipped: true, rent_amount: null, deposit_total: null, tenant_count: null,
-  duration_months: null, maintenance_payer: null, electricity_payer: null, painting_clause: null
+  duration_months: null, maintenance_payer: null, electricity_payer: null,
+  painting_clause: null, fixtures: []
 };
 
 // Structured, single-call extraction of the specific clause-level facts owners
-// need verified (rent/deposit/duration/who-pays-what/painting) -- strict JSON
-// is far less error-prone to consume than parsing these back out of prose, and
-// this is the one gateway call extractDeposit() below now delegates to instead
-// of running a second, separate call for the same document.
+// need verified (rent/deposit/duration/who-pays-what/painting/fixtures) --
+// strict JSON is far less error-prone to consume than parsing these back out
+// of prose, and this is the one gateway call extractDeposit() below now
+// delegates to instead of running a second, separate call for the same
+// document. fixtures maps to the move-in/appliances/handover area -- the
+// review step offers to seed the appliance registry from it (never silently).
 async function extractAgreementFacts(text) {
   if (!aiGateway.isConfigured() || !text || text.trim().length < 50) return { ...EMPTY_AGREEMENT_FACTS };
-  const prompt = `Read this Indian rental agreement and extract ONLY these facts as strict JSON, no other text, in exactly this shape:\n{"rent_amount": <number or null>, "deposit_total": <number or null>, "tenant_count": <integer or null>, "duration_months": <integer or null>, "maintenance_payer": <"owner"|"tenant"|null>, "electricity_payer": <"owner"|"tenant"|null>, "painting_clause": <string or null>}\n\n- rent_amount: the monthly rent, a plain number, no currency symbols/commas.\n- deposit_total: the total security deposit amount, a plain number.\n- tenant_count: how many tenants/occupants are explicitly named as parties.\n- duration_months: the lease duration in months (an integer).\n- maintenance_payer: who pays society/maintenance charges -- exactly "owner" or "tenant".\n- electricity_payer: who pays electricity charges -- exactly "owner" or "tenant".\n- painting_clause: any painting/whitewashing/one-time charge clause, stated briefly in your own words (e.g. "one month's rent"), or null if there is none.\n\nOnly state what is explicitly present in the text. If a detail isn't clearly and explicitly stated, use null -- never infer, guess, or estimate.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
-  const res = await aiGateway.run(prompt, { maxTokens: 400 });
+  const prompt = `Read this Indian rental agreement and extract ONLY these facts as strict JSON, no other text, in exactly this shape:\n{"rent_amount": <number or null>, "deposit_total": <number or null>, "tenant_count": <integer or null>, "duration_months": <integer or null>, "maintenance_payer": <"owner"|"tenant"|null>, "electricity_payer": <"owner"|"tenant"|null>, "painting_clause": <string or null>, "fixtures": <array of short strings>}\n\n- rent_amount: the monthly rent, a plain number, no currency symbols/commas.\n- deposit_total: the total security deposit amount, a plain number.\n- tenant_count: how many tenants/occupants are explicitly named as parties.\n- duration_months: the lease duration in months (an integer).\n- maintenance_payer: who pays society/maintenance charges -- exactly "owner" or "tenant".\n- electricity_payer: who pays electricity charges -- exactly "owner" or "tenant".\n- painting_clause: any painting/whitewashing/one-time charge clause, stated briefly in your own words (e.g. "one month's rent"), or null if there is none.\n- fixtures: any fittings/fixtures/appliances explicitly listed as provided with the property (e.g. "geyser", "modular kitchen", "wardrobe", "AC", "washing machine") -- short item names only, one per array entry, empty array if none listed.\n\nOnly state what is explicitly present in the text. If a detail isn't clearly and explicitly stated, use null (or an empty array for fixtures) -- never infer, guess, or estimate.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
+  const res = await aiGateway.run(prompt, { maxTokens: 500 });
   if (!res.ok) return { ...EMPTY_AGREEMENT_FACTS };
   try {
     const match = res.text.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(match ? match[0] : res.text);
     const num = (v) => typeof v === 'number' && v > 0 ? v : null;
     const payer = (v) => ['owner', 'tenant'].includes(v) ? v : null;
+    const fixtures = Array.isArray(parsed.fixtures)
+      ? [...new Set(parsed.fixtures.filter(f => typeof f === 'string' && f.trim()).map(f => f.trim().slice(0, 60)))].slice(0, 20)
+      : [];
     return {
       skipped: false,
       rent_amount: num(parsed.rent_amount),
@@ -42,7 +56,8 @@ async function extractAgreementFacts(text) {
       duration_months: typeof parsed.duration_months === 'number' && parsed.duration_months > 0 ? parsed.duration_months : null,
       maintenance_payer: payer(parsed.maintenance_payer),
       electricity_payer: payer(parsed.electricity_payer),
-      painting_clause: typeof parsed.painting_clause === 'string' && parsed.painting_clause.trim() ? parsed.painting_clause.trim().slice(0, 300) : null
+      painting_clause: typeof parsed.painting_clause === 'string' && parsed.painting_clause.trim() ? parsed.painting_clause.trim().slice(0, 300) : null,
+      fixtures
     };
   } catch (err) {
     console.warn('llm.js: extractAgreementFacts could not parse gateway response:', err.message);
