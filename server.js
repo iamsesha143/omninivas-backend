@@ -427,7 +427,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
 }
 
 const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText } = require('./parsers');
-const { summarizeAgreement, extractDeposit, compareMoveInOut } = require('./llm');
+const { summarizeAgreement, extractAgreementFacts, compareMoveInOut } = require('./llm');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
   try {
@@ -435,13 +435,26 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
     if (!text || text.trim().length < 50) return res.status(400).json({ error: 'Could not extract text from document', textLength: text.length });
     const propertyData = parsePropertyFromText(text);
+    // One gateway call now covers both the narrative summary's source data and
+    // the structured clause facts below -- summarizeAgreement is a second call
+    // for the prose text only (extractAgreementFacts can't produce that).
     const { summary } = await summarizeAgreement(text);
-    const deposit = await extractDeposit(text);
+    const facts = await extractAgreementFacts(text);
     res.json({
       success: true, extractedData: propertyData, agreementSummary: summary,
       // skipped=true (missing key, short/unparsable text, or a failed call) simply
       // means no suggestion -- the frontend falls back to manual-only deposit entry.
-      depositSuggestion: deposit.skipped ? null : { total: deposit.total, tenantCount: deposit.tenantCount }
+      depositSuggestion: (facts.skipped || facts.deposit_total === null) ? null : { total: facts.deposit_total, tenantCount: facts.tenant_count },
+      // Additive: clause-level facts for the review step to show as verifiable,
+      // editable suggestions -- never auto-written anywhere (obligations still
+      // come from the owner's own manual setup, same as before this change).
+      agreementFacts: facts.skipped ? null : {
+        rentAmount: facts.rent_amount,
+        durationMonths: facts.duration_months,
+        maintenancePayer: facts.maintenance_payer,
+        electricityPayer: facts.electricity_payer,
+        paintingClause: facts.painting_clause
+      }
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
@@ -1436,6 +1449,18 @@ function extractChatTextFromZip(buffer) {
 }
 const { extractWhatsAppFacts } = require('./llm');
 
+// Defense-in-depth alongside the extraction prompt's own instruction: mask any
+// 10+ digit run (Aadhaar/PAN-length numbers) before a fact ever reaches the DB,
+// in case the model doesn't follow the prompt's redaction rule.
+const redactLongDigitRuns = (s) => (s || '').replace(/\d{10,}/g, (m) => `${m.slice(0, 2)}${'*'.repeat(m.length - 2)}`);
+
+// Identifies a message by its own content rather than by import-local seq
+// (which resets to 0 per import) -- sender+body is stable and byte-identical
+// across overlapping re-exports of the same conversation, unlike the AI's
+// worded-differently-each-call "value" text, which is too unreliable to
+// dedup facts against directly.
+const messageSignature = (sender, body) => `${(sender || '').trim().toLowerCase()}::${(body || '').trim().toLowerCase()}`;
+
 // Owner uploads a WhatsApp .txt export. Parses synchronously (no queue/cron infra
 // in this codebase) into whatsapp_messages, then runs AI extraction into
 // whatsapp_extracted_facts. An AI failure/absence only downgrades status to
@@ -1487,18 +1512,62 @@ app.post('/api/whatsapp/import', verifyToken, upload.single('file'), async (req,
     const nonSystem = messages.filter(m => !m.is_system);
     const extraction = await extractWhatsAppFacts(nonSystem);
     let finalStatus = 'extraction_unavailable';
+    let duplicateCount = 0;
     if (!extraction.skipped) {
-      if (extraction.facts.length > 0) {
-        await supabase.from('whatsapp_extracted_facts').insert(extraction.facts.map(f => ({
-          import_id: importRow.id, category: f.category, fact_type: f.fact_type || null,
-          value: String(f.value), confidence: typeof f.confidence === 'number' ? f.confidence : null,
-          evidence: f.evidence || null, message_seq: typeof f.message_seq === 'number' ? f.message_seq : null
-        })));
+      let candidateFacts = extraction.facts.map(f => ({
+        import_id: importRow.id, category: f.category, fact_type: f.fact_type || null,
+        value: redactLongDigitRuns(String(f.value)), confidence: typeof f.confidence === 'number' ? f.confidence : null,
+        evidence: redactLongDigitRuns(f.evidence || ''), message_seq: typeof f.message_seq === 'number' ? f.message_seq : null
+      }));
+
+      // Merge into the same property's history instead of creating duplicate
+      // parallel facts: when this import is attached to a property, skip any
+      // new fact whose SOURCE MESSAGE (by content, not import-local seq) was
+      // already extracted from in an earlier import for that same property --
+      // common when an owner re-exports an overlapping/extended chat. Dedup by
+      // source message rather than by the fact's own wording because the AI
+      // doesn't reproduce identical "value" text for the same fact across
+      // separate calls, so comparing fact values directly misses most real
+      // duplicates. Raw messages are never deduped or dropped -- only this
+      // derived-facts layer is.
+      if (propertyId) {
+        const { data: priorImports } = await supabase.from('whatsapp_imports').select('id').eq('property_id', propertyId).eq('user_id', req.userId).neq('id', importRow.id);
+        const priorImportIds = (priorImports || []).map(i => i.id);
+        if (priorImportIds.length > 0) {
+          const [{ data: priorFacts }, { data: priorMessages }] = await Promise.all([
+            supabase.from('whatsapp_extracted_facts').select('import_id, message_seq').in('import_id', priorImportIds).not('message_seq', 'is', null).neq('status', 'rejected'),
+            supabase.from('whatsapp_messages').select('import_id, seq, sender, body').in('import_id', priorImportIds)
+          ]);
+          const priorMsgByKey = new Map((priorMessages || []).map(m => [`${m.import_id}::${m.seq}`, m]));
+          const alreadyExtractedFrom = new Set();
+          for (const f of priorFacts || []) {
+            const msg = priorMsgByKey.get(`${f.import_id}::${f.message_seq}`);
+            if (msg) alreadyExtractedFrom.add(messageSignature(msg.sender, msg.body));
+          }
+          const currentMsgBySeq = new Map(nonSystem.map(m => [m.seq, m]));
+          const before = candidateFacts.length;
+          candidateFacts = candidateFacts.filter(f => {
+            const srcMsg = currentMsgBySeq.get(f.message_seq);
+            // No resolvable source message -- keep it rather than risk
+            // dropping a legitimate fact on an unrelated technicality.
+            if (!srcMsg) return true;
+            return !alreadyExtractedFrom.has(messageSignature(srcMsg.sender, srcMsg.body));
+          });
+          duplicateCount = before - candidateFacts.length;
+        }
+      }
+
+      if (candidateFacts.length > 0) {
+        await supabase.from('whatsapp_extracted_facts').insert(candidateFacts);
       }
       finalStatus = 'extracted';
     }
     const { data: updated } = await supabase.from('whatsapp_imports').update({ status: finalStatus }).eq('id', importRow.id).select().single();
-    res.status(201).json({ import: updated, message_count: messages.length, fact_count: extraction.skipped ? 0 : extraction.facts.length });
+    res.status(201).json({
+      import: updated, message_count: messages.length,
+      fact_count: extraction.skipped ? 0 : extraction.facts.length - duplicateCount,
+      duplicate_fact_count: duplicateCount
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -120,12 +120,26 @@ const parsePropertyFromText = (text) => {
     agreementStartDate = `${yyyy}-${mm.padStart(2, '0')}-${dd.padStart(2, '0')}`;
   }
 
-  // Duration: "period of 11 months", "11 (eleven) months", "for 11 months".
+  // Duration: prefer a phrase anchored to the actual lease-term clause (e.g.
+  // "period of 11 months", "lease period of 11 (eleven) months", "term of 11
+  // months") over a bare "N months" match -- an unanchored match can pick up
+  // an unrelated "1 month" notice-period clause instead if that phrase happens
+  // to appear earlier in the document than the real lease duration.
   let agreementMonths = null;
-  const durationMatch = text.match(/(\d{1,2})\s*(?:\([a-z]+\)\s*)?months?/i);
-  if (durationMatch) {
-    const n = parseInt(durationMatch[1], 10);
+  // [\s\S]{0,40}? tolerates real-world phrasing like "period of this agreement
+  // shall be 11 months" where the number isn't immediately adjacent to "period
+  // of" -- bounded and lazy so it can't reach across into an unrelated clause.
+  const anchoredDuration = text.match(/(?:(?:lease|tenancy|rental)?\s*period\s+of|for\s+a\s+period\s+of|term\s+of)[\s\S]{0,40}?(\d{1,2})\s*(?:\([a-z]+\)\s*)?months?/i);
+  if (anchoredDuration) {
+    const n = parseInt(anchoredDuration[1], 10);
     if (n >= 1 && n <= 60) agreementMonths = n;
+  }
+  if (agreementMonths === null) {
+    const durationMatch = text.match(/(\d{1,2})\s*(?:\([a-z]+\)\s*)?months?/i);
+    if (durationMatch) {
+      const n = parseInt(durationMatch[1], 10);
+      if (n >= 1 && n <= 60) agreementMonths = n;
+    }
   }
 
   return {

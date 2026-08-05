@@ -8,28 +8,55 @@ const aiGateway = require('./aiGateway');
 
 async function summarizeAgreement(text) {
   if (!aiGateway.isConfigured() || !text || text.trim().length < 50) return { skipped: true, summary: null };
-  const prompt = `Summarize the key terms of this Indian rental agreement in 4-6 short plain-English bullet points (rent amount, security deposit, notice period, who pays which bills, and any unusual clauses). Only state what is explicitly present in the text below -- never infer or guess a detail that isn't there. If a detail isn't mentioned, omit it rather than guessing.\n\nAgreement text:\n\n${text.slice(0, 12000)}`;
-  const res = await aiGateway.run(prompt, { maxTokens: 400 });
+  const prompt = `Summarize the key terms of this Indian rental agreement in plain-English bullet points. You MUST explicitly address each of the following, one bullet each, and say "not stated" for any that genuinely aren't in the text -- do not fold several of these into one vague bullet or skip any of them silently:\n- Monthly rent amount\n- Security deposit amount\n- Lease duration / notice period\n- Who pays society maintenance charges (owner or tenant)\n- Who pays electricity charges (owner or tenant)\n- Any painting/whitewashing/one-time charge clause\n- Any other unusual clause worth flagging\n\nOnly state what is explicitly present in the text below -- never infer or guess a detail that isn't there.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
+  const res = await aiGateway.run(prompt, { maxTokens: 500 });
   if (!res.ok) return { skipped: true, summary: null };
   return { skipped: false, summary: res.text };
 }
 
-async function extractDeposit(text) {
-  if (!aiGateway.isConfigured() || !text || text.trim().length < 50) return { skipped: true, total: null, tenantCount: null };
-  const prompt = `Read this Indian rental agreement and extract ONLY two facts as strict JSON, no other text: {"deposit_total": <number or null>, "tenant_count": <integer or null>}. deposit_total is the total security deposit amount explicitly stated (a plain number, no currency symbols or commas). tenant_count is how many tenants/occupants are explicitly named as parties on the agreement. If either isn't clearly stated, use null -- never guess or estimate.\n\nAgreement text:\n\n${text.slice(0, 12000)}`;
-  const res = await aiGateway.run(prompt, { maxTokens: 200 });
-  if (!res.ok) return { skipped: true, total: null, tenantCount: null };
+const EMPTY_AGREEMENT_FACTS = {
+  skipped: true, rent_amount: null, deposit_total: null, tenant_count: null,
+  duration_months: null, maintenance_payer: null, electricity_payer: null, painting_clause: null
+};
+
+// Structured, single-call extraction of the specific clause-level facts owners
+// need verified (rent/deposit/duration/who-pays-what/painting) -- strict JSON
+// is far less error-prone to consume than parsing these back out of prose, and
+// this is the one gateway call extractDeposit() below now delegates to instead
+// of running a second, separate call for the same document.
+async function extractAgreementFacts(text) {
+  if (!aiGateway.isConfigured() || !text || text.trim().length < 50) return { ...EMPTY_AGREEMENT_FACTS };
+  const prompt = `Read this Indian rental agreement and extract ONLY these facts as strict JSON, no other text, in exactly this shape:\n{"rent_amount": <number or null>, "deposit_total": <number or null>, "tenant_count": <integer or null>, "duration_months": <integer or null>, "maintenance_payer": <"owner"|"tenant"|null>, "electricity_payer": <"owner"|"tenant"|null>, "painting_clause": <string or null>}\n\n- rent_amount: the monthly rent, a plain number, no currency symbols/commas.\n- deposit_total: the total security deposit amount, a plain number.\n- tenant_count: how many tenants/occupants are explicitly named as parties.\n- duration_months: the lease duration in months (an integer).\n- maintenance_payer: who pays society/maintenance charges -- exactly "owner" or "tenant".\n- electricity_payer: who pays electricity charges -- exactly "owner" or "tenant".\n- painting_clause: any painting/whitewashing/one-time charge clause, stated briefly in your own words (e.g. "one month's rent"), or null if there is none.\n\nOnly state what is explicitly present in the text. If a detail isn't clearly and explicitly stated, use null -- never infer, guess, or estimate.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
+  const res = await aiGateway.run(prompt, { maxTokens: 400 });
+  if (!res.ok) return { ...EMPTY_AGREEMENT_FACTS };
   try {
     const match = res.text.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(match ? match[0] : res.text);
-    const total = typeof parsed.deposit_total === 'number' && parsed.deposit_total > 0 ? parsed.deposit_total : null;
-    const tenantCount = typeof parsed.tenant_count === 'number' && parsed.tenant_count > 0 ? parsed.tenant_count : null;
-    if (total === null) return { skipped: true, total: null, tenantCount: null };
-    return { skipped: false, total, tenantCount };
+    const num = (v) => typeof v === 'number' && v > 0 ? v : null;
+    const payer = (v) => ['owner', 'tenant'].includes(v) ? v : null;
+    return {
+      skipped: false,
+      rent_amount: num(parsed.rent_amount),
+      deposit_total: num(parsed.deposit_total),
+      tenant_count: typeof parsed.tenant_count === 'number' && parsed.tenant_count > 0 ? parsed.tenant_count : null,
+      duration_months: typeof parsed.duration_months === 'number' && parsed.duration_months > 0 ? parsed.duration_months : null,
+      maintenance_payer: payer(parsed.maintenance_payer),
+      electricity_payer: payer(parsed.electricity_payer),
+      painting_clause: typeof parsed.painting_clause === 'string' && parsed.painting_clause.trim() ? parsed.painting_clause.trim().slice(0, 300) : null
+    };
   } catch (err) {
-    console.warn('llm.js: extractDeposit could not parse gateway response:', err.message);
-    return { skipped: true, total: null, tenantCount: null };
+    console.warn('llm.js: extractAgreementFacts could not parse gateway response:', err.message);
+    return { ...EMPTY_AGREEMENT_FACTS };
   }
+}
+
+// Kept as a thin wrapper so its external contract (server.js, deposit-confirm
+// flow) is unchanged -- callers that only need the deposit/tenant-count subset
+// don't need to know a richer extraction exists underneath.
+async function extractDeposit(text) {
+  const facts = await extractAgreementFacts(text);
+  if (facts.skipped || facts.deposit_total === null) return { skipped: true, total: null, tenantCount: null };
+  return { skipped: false, total: facts.deposit_total, tenantCount: facts.tenant_count };
 }
 
 // Compares a move-in item list against a move-out item list and suggests
@@ -66,7 +93,10 @@ async function compareMoveInOut(moveInItems, moveOutItems) {
 // structured facts for owner review. Every fact must carry an evidence snippet
 // and a source message_seq so the frontend can show "why" -- never returned as
 // final truth, only as something to Approve/Edit/Reject.
-const WHATSAPP_CATEGORIES = ['person', 'property_reference', 'payment', 'deposit', 'date_milestone', 'maintenance', 'vendor', 'commitment'];
+const WHATSAPP_CATEGORIES = [
+  'person', 'property_reference', 'payment', 'deposit', 'date_milestone',
+  'maintenance', 'vendor', 'commitment', 'document_reference', 'utility_cost'
+];
 
 async function extractWhatsAppFacts(messages) {
   if (!aiGateway.isConfigured() || !messages || messages.length === 0) return { skipped: true, facts: [] };
@@ -74,19 +104,28 @@ async function extractWhatsAppFacts(messages) {
   const capped = messages.slice(0, 400);
   const payload = capped.map(m => ({ seq: m.seq, sender: m.sender, text: m.body })).filter(m => m.text);
   const json = JSON.stringify(payload).slice(0, 20000);
-  const prompt = `This is a WhatsApp conversation between an Indian landlord and tenant, as an array of {seq, sender, text}. Extract candidate facts an owner could use to build/enrich their records. Only extract what is explicitly stated -- never infer or guess a number or date that isn't written. Each fact must include the source message's seq and a short verbatim evidence snippet copied from that message's text.\n\nValid categories (use exactly these strings): ${WHATSAPP_CATEGORIES.join(', ')}.\n- person: a named individual and their apparent role (tenant/owner/vendor/other).\n- property_reference: any mention of a flat/unit/address/property name.\n- payment: a stated rent amount or payment confirmation.\n- deposit: a stated security deposit amount or refund mention.\n- date_milestone: a move-in or move-out date.\n- maintenance: a reported issue (e.g. "geyser not working").\n- vendor: a mentioned service person/company (electrician, plumber, etc.) and contact info if given.\n- commitment: a promise or follow-up (e.g. "will pay by 5th", "will send plumber tomorrow").\n\nRespond with ONLY strict JSON, no other text, in exactly this shape: {"facts": [{"category": string, "fact_type": string, "value": string, "confidence": number (0-1), "evidence": string, "message_seq": number}]}. Omit anything not clearly supported by the text -- an empty facts array is a valid answer.\n\nConversation:\n${json}`;
-  const res = await aiGateway.run(prompt, { maxTokens: 2000 });
+  const prompt = `This is a WhatsApp conversation between an Indian landlord and tenant, as an array of {seq, sender, text}. Extract candidate facts an owner could use to build/enrich their records. Only extract what is explicitly stated -- never infer or guess a number or date that isn't written. Each fact must include the source message's seq and a short verbatim evidence snippet copied from that message's text. SAFETY RULE: never copy an actual Aadhaar/PAN/ID number (or any 10+ digit sequence) into "value" or "evidence" -- describe that a document was shared/requested instead, e.g. value "Aadhaar copy shared", not the number itself.\n\nValid categories (use exactly these strings): ${WHATSAPP_CATEGORIES.join(', ')}.\n- person: a named individual and their apparent role (tenant/owner/vendor/other).\n- property_reference: any mention of a flat/unit/address/property name.\n- payment: rent paid/due history -- a stated rent amount, a rent payment confirmation, or a rent still owed. Use fact_type "rent_payment" or "rent_due".\n- deposit: security deposit history -- amount agreed, amount paid, or a refund/deduction mention. Use fact_type "deposit_paid", "deposit_agreed", or "deposit_refund".\n- date_milestone: a move-in or move-out date.\n- maintenance: a reported issue, OR a repair that was carried out (e.g. "geyser not working", "plumber fixed the leak yesterday"). Use fact_type "issue_reported" or "repair_completed".\n- utility_cost: an electricity, water, or other utility bill amount or payment mention (e.g. "electricity bill was 1200 this month"). Use fact_type "electricity_cost", "water_cost", or "other_utility_cost".\n- vendor: a mentioned service person/company (electrician, plumber, etc.) and contact info if given.\n- commitment: a promise or follow-up with or without a date (e.g. "will pay by 5th", "will send plumber tomorrow").\n- document_reference: a mention of Aadhaar, PAN, ID proof, or another document being shared/pending/requested (e.g. "sending Aadhaar copy", "need your PAN for the agreement") -- never extract the actual document number as the value, only that a document was referenced and its status.\n\nRespond with ONLY strict JSON, no other text, in exactly this shape: {"facts": [{"category": string, "fact_type": string, "value": string, "confidence": number (0-1), "evidence": string, "message_seq": number}]}. Omit anything not clearly supported by the text -- an empty facts array is a valid answer.\n\nConversation:\n${json}`;
+  const res = await aiGateway.run(prompt, { maxTokens: 2400 });
   if (!res.ok) return { skipped: true, facts: [] };
+  const match = res.text.match(/\{[\s\S]*\}/);
+  const raw = match ? match[0] : res.text;
+  let facts = null;
   try {
-    const match = res.text.match(/\{[\s\S]*\}/);
-    const parsed = JSON.parse(match ? match[0] : res.text);
-    if (!Array.isArray(parsed.facts)) return { skipped: true, facts: [] };
-    const facts = parsed.facts.filter(f => WHATSAPP_CATEGORIES.includes(f.category) && f.value);
-    return { skipped: false, facts };
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.facts)) facts = parsed.facts;
   } catch (err) {
-    console.warn('llm.js: extractWhatsAppFacts could not parse gateway response:', err.message);
-    return { skipped: true, facts: [] };
+    // Free-tier models occasionally cut off mid-object on a longer facts
+    // array, breaking the outer JSON. Don't discard the whole extraction for
+    // that -- salvage whichever individual {...} objects ARE complete and
+    // valid instead of losing every fact because the last one got truncated.
+    console.warn('llm.js: extractWhatsAppFacts got malformed JSON, attempting salvage:', err.message);
+    facts = (raw.match(/\{[^{}]*\}/g) || [])
+      .map(s => { try { return JSON.parse(s); } catch (_) { return null; } })
+      .filter(Boolean);
   }
+  if (!facts || facts.length === 0) return { skipped: true, facts: [] };
+  const filtered = facts.filter(f => f && WHATSAPP_CATEGORIES.includes(f.category) && f.value);
+  return { skipped: false, facts: filtered };
 }
 
-module.exports = { summarizeAgreement, extractDeposit, compareMoveInOut, extractWhatsAppFacts, WHATSAPP_CATEGORIES };
+module.exports = { summarizeAgreement, extractDeposit, extractAgreementFacts, compareMoveInOut, extractWhatsAppFacts, WHATSAPP_CATEGORIES };
