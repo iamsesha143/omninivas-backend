@@ -622,10 +622,26 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
 
 app.post('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
   try {
-    const { description, amount, cost_date, paid_by, status } = req.body;
-    if (!description || !amount) return res.status(400).json({ error: 'Description and amount required' });
+    const { description, amount, cost_date, paid_by, status, vendor_name, vendor_phone, category, tenant_id } = req.body;
+    // amount is no longer required -- a maintenance episode pulled from a chat
+    // often has no stated cost yet (issue just reported, or fixed under
+    // warranty/free callout); the record itself is still worth having, with
+    // amount defaulting to 0 and editable later once a real cost is known.
+    if (!description) return res.status(400).json({ error: 'Description required' });
     if (!['tenant', 'owner'].includes(paid_by)) return res.status(400).json({ error: 'paid_by must be tenant or owner' });
-    const { data, error } = await supabase.from('maintenance_costs').insert([{ property_id: req.params.propertyId, user_id: req.userId, description: description.trim(), amount: parseFloat(amount), cost_date: cost_date || new Date().toISOString().split('T')[0], paid_by: paid_by, status: status || 'pending' }]).select();
+    // vendor_name/vendor_phone/category were already columns on maintenance_costs
+    // but never accepted here -- a maintenance episode with a named vendor (e.g.
+    // from a WhatsApp mention) had nowhere to record who did the work.
+    const row = {
+      property_id: req.params.propertyId, user_id: req.userId, description: description.trim(),
+      amount: amount ? parseFloat(amount) : 0, cost_date: cost_date || new Date().toISOString().split('T')[0],
+      paid_by: paid_by, status: status || 'pending',
+      vendor_name: vendor_name ? vendor_name.trim() : null,
+      vendor_phone: vendor_phone ? vendor_phone.trim() : null,
+      category: category ? category.trim() : null,
+      tenant_id: tenant_id || null
+    };
+    const { data, error } = await supabase.from('maintenance_costs').insert([row]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
@@ -1323,7 +1339,7 @@ app.post('/api/tenant/obligations/:obligationId/proof', verifyToken, upload.sing
 app.patch('/api/tenants/:id', verifyToken, requireOwner, async (req, res) => {
   try {
     const allowed = {};
-    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'date_of_move_in', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active', 'document_log']) {
+    for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'date_of_move_in', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active', 'document_log', 'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relationship']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { data, error } = await supabase.from('tenants').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
