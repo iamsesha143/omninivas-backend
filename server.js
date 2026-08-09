@@ -15,6 +15,9 @@ const path = require('path');
 const os = require('os');
 const rateLimit = require('express-rate-limit');
 const { Redis } = require('@upstash/redis');
+const mw = require('./maintenanceWorkflow');
+const reminders = require('./reminders');
+const { todayISOInTimezone, dueDateForExplicitMonth } = require('./dateUtils');
 
 const app = express();
 
@@ -135,6 +138,36 @@ const verifyToken = (req, res, next) => {
 const requireOwner = (req, res, next) => {
   if (req.role !== 'owner') return res.status(403).json({ error: 'Owner access only' });
   next();
+};
+
+// Standard error responses for the maintenance/equipment/vendor/rent-credit
+// routes (migration 014 and everything built on it). A cross-owner or
+// cross-tenant lookup and a genuinely nonexistent resource both produce this
+// exact same 404 -- never distinguishing "doesn't exist" from "exists but
+// isn't yours" in the response. Unexpected errors are logged with full
+// detail server-side and NEVER expose err.message/SQL/constraint names/
+// storage paths/credentials to the client.
+const notFound = (res) => res.status(404).json({ error: 'Not found' });
+const badRequest = (res, message) => res.status(400).json({ error: message });
+const unexpectedError = (routeLabel, err, res) => {
+  console.error(`[${routeLabel}]`, err);
+  res.status(500).json({ error: 'Unable to complete the request.' });
+};
+
+// Multer throws (calls next(err)) for file-count/size violations, which
+// would otherwise bypass the route handler entirely and fall through to the
+// generic 500 error handler at the bottom of this file -- a validation
+// failure, not an unexpected server error. This 4-arg (error-handling)
+// middleware sits between `upload.array(...)` and the route handler on
+// every evidence-upload route, converting known Multer errors into the same
+// 400 policy as everything else, and any other upload error into a generic
+// safe message. Never exposes err.message/multer internals to the client.
+const handleUploadErrors = (err, req, res, next) => {
+  if (!err) return next();
+  if (err.code === 'LIMIT_FILE_COUNT') return badRequest(res, `At most ${mw.MAX_EVIDENCE_FILES} files allowed per request`);
+  if (err.code === 'LIMIT_FILE_SIZE') return badRequest(res, 'One or more files exceed the maximum file size');
+  if (err.code === 'LIMIT_UNEXPECTED_FILE') return badRequest(res, 'Unexpected file field');
+  return badRequest(res, 'Invalid file upload');
 };
 
 app.get('/health', (req, res) => {
@@ -620,53 +653,555 @@ app.get('/api/properties/:propertyId/payments', verifyToken, async (req, res) =>
   }
 });
 
-app.post('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
+// OWNER: create a maintenance record directly (not via a tenant report).
+// requireOwner + an explicit property-ownership check were both missing
+// before this slice -- a non-owner token could previously insert a row
+// against any propertyId with no verification at all.
+app.post('/api/properties/:propertyId/maintenance', verifyToken, requireOwner, async (req, res) => {
   try {
-    const { description, amount, cost_date, paid_by, status, vendor_name, vendor_phone, category, tenant_id } = req.body;
-    // amount is no longer required -- a maintenance episode pulled from a chat
-    // often has no stated cost yet (issue just reported, or fixed under
-    // warranty/free callout); the record itself is still worth having, with
-    // amount defaulting to 0 and editable later once a real cost is known.
-    if (!description) return res.status(400).json({ error: 'Description required' });
-    if (!['tenant', 'owner'].includes(paid_by)) return res.status(400).json({ error: 'paid_by must be tenant or owner' });
-    // vendor_name/vendor_phone/category were already columns on maintenance_costs
-    // but never accepted here -- a maintenance episode with a named vendor (e.g.
-    // from a WhatsApp mention) had nowhere to record who did the work.
+    const { description, amount, cost_date, paid_by, vendor_name, vendor_phone, vendor_id, appliance_id, category, tenant_id, urgency, request_status } = req.body;
+    if (!description || !description.trim()) return badRequest(res, 'Description required');
+    if (!mw.isValidPaidBy(paid_by)) return badRequest(res, 'paid_by must be owner, tenant, or shared');
+    if (!mw.isValidOptionalNonNegativeAmount(amount)) return badRequest(res, 'amount must be a non-negative number');
+    if (!mw.isValidUrgency(urgency)) return badRequest(res, 'urgency must be low, normal, or high');
+    const status = request_status || 'resolved'; // owner-created entries default to already-decided, matching prior behavior
+    if (!mw.isValidRequestStatus(status)) return badRequest(res, 'Invalid request_status');
+
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+    if (!property) return notFound(res);
+
+    if (appliance_id) {
+      const { data: appl } = await supabase.from('appliances').select('id').eq('id', appliance_id).eq('property_id', req.params.propertyId).eq('user_id', req.userId).maybeSingle();
+      if (!appl) return badRequest(res, 'appliance_id does not belong to this property');
+    }
+    if (vendor_id) {
+      const { data: v } = await supabase.from('vendors').select('id').eq('id', vendor_id).eq('user_id', req.userId).maybeSingle();
+      if (!v) return badRequest(res, 'vendor_id not found');
+    }
+
     const row = {
       property_id: req.params.propertyId, user_id: req.userId, description: description.trim(),
-      amount: amount ? parseFloat(amount) : 0, cost_date: cost_date || new Date().toISOString().split('T')[0],
-      paid_by: paid_by, status: status || 'pending',
+      amount: amount !== undefined && amount !== null && amount !== '' ? parseFloat(amount) : 0,
+      cost_date: cost_date || new Date().toISOString().split('T')[0],
+      paid_by, status: 'pending', request_status: status, reported_by: 'owner',
       vendor_name: vendor_name ? vendor_name.trim() : null,
       vendor_phone: vendor_phone ? vendor_phone.trim() : null,
+      vendor_id: vendor_id || null,
+      appliance_id: appliance_id || null,
       category: category ? category.trim() : null,
-      tenant_id: tenant_id || null
+      tenant_id: tenant_id || null,
+      urgency: urgency || null,
+      decided_by: req.userId,
+      approved_at: ['approved', 'in_progress', 'resolved'].includes(status) ? new Date().toISOString() : null,
+      resolved_at: status === 'resolved' ? new Date().toISOString() : null
     };
     const { data, error } = await supabase.from('maintenance_costs').insert([row]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    unexpectedError('POST /api/properties/:propertyId/maintenance', err, res);
   }
 });
 
-app.get('/api/properties/:propertyId/maintenance', verifyToken, async (req, res) => {
+app.get('/api/properties/:propertyId/maintenance', verifyToken, requireOwner, async (req, res) => {
   try {
     const { data, error } = await supabase.from('maintenance_costs').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).order('cost_date', { ascending: false });
     if (error) throw error;
     res.json(data || []);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    unexpectedError('GET /api/properties/:propertyId/maintenance', err, res);
   }
 });
 
-app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken, async (req, res) => {
+// OWNER: approve/reject/progress/resolve a maintenance request, and/or edit
+// its cost/vendor/appliance details. evidence_urls is intentionally NOT in
+// this allowlist -- there is no owner-side upload endpoint in this slice, so
+// evidence stays immutable through this route (tenant-uploaded only). A
+// terminal record (resolved/rejected) is fully locked: no field on it may
+// change through this route, not just request_status.
+app.patch('/api/properties/:propertyId/maintenance/:maintenanceId', verifyToken, requireOwner, async (req, res) => {
   try {
+    const { data: existing } = await supabase.from('maintenance_costs').select('*').eq('id', req.params.maintenanceId).eq('property_id', req.params.propertyId).eq('user_id', req.userId).maybeSingle();
+    if (!existing) return notFound(res);
+    if (mw.isTerminalRequestStatus(existing.request_status)) {
+      return badRequest(res, 'This maintenance request is already finalized and cannot be modified.');
+    }
+
+    const { request_status, amount, paid_by, vendor_id, vendor_name, vendor_phone, appliance_id, category, owner_decision_note, urgency } = req.body;
+    const allowed = {};
+
+    if (request_status !== undefined) {
+      if (!mw.canTransitionRequestStatus(existing.request_status, request_status)) {
+        return badRequest(res, `Cannot move a "${existing.request_status}" request to "${request_status}"`);
+      }
+      allowed.request_status = request_status;
+      allowed.decided_by = req.userId;
+      if (['approved', 'rejected'].includes(request_status)) allowed.approved_at = new Date().toISOString();
+      if (request_status === 'resolved') allowed.resolved_at = new Date().toISOString();
+    }
+    if (amount !== undefined) {
+      if (!mw.isValidOptionalNonNegativeAmount(amount)) return badRequest(res, 'amount must be a non-negative number');
+      allowed.amount = parseFloat(amount);
+    }
+    if (paid_by !== undefined) {
+      if (!mw.isValidPaidBy(paid_by)) return badRequest(res, 'paid_by must be owner, tenant, or shared');
+      allowed.paid_by = paid_by;
+    }
+    if (urgency !== undefined) {
+      if (!mw.isValidUrgency(urgency)) return badRequest(res, 'urgency must be low, normal, or high');
+      allowed.urgency = urgency;
+    }
+    if (vendor_id !== undefined) {
+      if (vendor_id) {
+        const { data: v } = await supabase.from('vendors').select('id').eq('id', vendor_id).eq('user_id', req.userId).maybeSingle();
+        if (!v) return badRequest(res, 'vendor_id not found');
+      }
+      allowed.vendor_id = vendor_id || null;
+    }
+    if (appliance_id !== undefined) {
+      if (appliance_id) {
+        const { data: a } = await supabase.from('appliances').select('id').eq('id', appliance_id).eq('property_id', req.params.propertyId).eq('user_id', req.userId).maybeSingle();
+        if (!a) return badRequest(res, 'appliance_id does not belong to this property');
+      }
+      allowed.appliance_id = appliance_id || null;
+    }
+    if (vendor_name !== undefined) allowed.vendor_name = vendor_name ? vendor_name.trim() : null;
+    if (vendor_phone !== undefined) allowed.vendor_phone = vendor_phone ? vendor_phone.trim() : null;
+    if (category !== undefined) allowed.category = category ? category.trim() : null;
+    if (owner_decision_note !== undefined) allowed.owner_decision_note = owner_decision_note ? owner_decision_note.trim() : null;
+
+    // When request_status is changing, condition the write on the exact
+    // status just read -- if a concurrent request already transitioned this
+    // row, zero rows come back instead of silently applying a transition
+    // that was validated against a status that's no longer current.
+    let updateQuery = supabase.from('maintenance_costs').update(allowed).eq('id', req.params.maintenanceId);
+    if (request_status !== undefined) {
+      updateQuery = updateQuery.eq('request_status', existing.request_status);
+    }
+    const { data, error } = await updateQuery.select();
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      return res.status(409).json({ error: 'This maintenance request was already updated. Refresh and try again.' });
+    }
+    res.json(data[0]);
+  } catch (err) {
+    unexpectedError('PATCH /api/properties/:propertyId/maintenance/:maintenanceId', err, res);
+  }
+});
+
+// ===== RENT CREDITS / REIMBURSEMENTS (migration 014) =====
+// Only a tenant-paid, owner-decided maintenance event can be settled -- this
+// route never auto-approves anything; the maintenance record must already
+// carry a real amount and paid_by='tenant' before a settlement can exist.
+
+app.post('/api/maintenance/:id/settlement', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { data: maintenance } = await supabase.from('maintenance_costs').select('id, property_id, tenant_id, paid_by, amount').eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
+    if (!maintenance) return notFound(res);
+    if (maintenance.paid_by !== 'tenant') {
+      return badRequest(res, 'Only a tenant-paid maintenance expense can be settled with a reimbursement or rent credit.');
+    }
+
+    const { type, amount, applicable_period, notes } = req.body;
+    if (!mw.isValidSettlementType(type)) return badRequest(res, 'type must be rent_credit or reimbursement');
+    if (!mw.isValidPositiveAmount(amount)) return badRequest(res, 'amount must be a positive number');
+
+    let normalizedPeriod = null;
+    if (type === 'rent_credit') {
+      if (!maintenance.tenant_id) {
+        return badRequest(res, 'A rent credit requires a maintenance record linked to a tenant.');
+      }
+      if (!req.body.applicable_period) return badRequest(res, 'applicable_period is required for a rent credit');
+      const periodResult = mw.normalizeApplicablePeriod(applicable_period);
+      if (periodResult.error) return badRequest(res, periodResult.error);
+      normalizedPeriod = periodResult.value;
+    }
+
+    const row = {
+      property_id: maintenance.property_id, tenant_id: maintenance.tenant_id, user_id: req.userId,
+      maintenance_cost_id: maintenance.id, type, amount: parseFloat(amount),
+      status: 'pending', applicable_period: normalizedPeriod, notes: notes ? notes.trim() : null
+    };
+    const { data, error } = await supabase.from('rent_credits').insert([row]).select();
+    if (error) {
+      // The DB is the final authority on "at most one active settlement per
+      // maintenance event" (uq_rent_credits_active_per_maintenance) -- this
+      // is the one place a raw Postgres error code maps to a specific,
+      // friendly response rather than falling through to the generic 500.
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'This maintenance event already has an active settlement. Cancel it first if you need to change the settlement type.' });
+      }
+      throw error;
+    }
+    res.status(201).json(data[0]);
+  } catch (err) {
+    unexpectedError('POST /api/maintenance/:id/settlement', err, res);
+  }
+});
+
+app.get('/api/properties/:propertyId/rent-credits', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).maybeSingle();
+    if (!property) return notFound(res);
+    const { data, error } = await supabase.from('rent_credits').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    unexpectedError('GET /api/properties/:propertyId/rent-credits', err, res);
+  }
+});
+
+// OWNER: apply or cancel a pending settlement. Closed transition set --
+// pending->applied and pending->cancelled are the only two legal writes
+// through this route; applied/cancelled rows are immutable here.
+app.patch('/api/rent-credits/:id', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { data: credit } = await supabase.from('rent_credits').select('*').eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
+    if (!credit) return notFound(res);
+
     const { status } = req.body;
-    const { data, error } = await supabase.from('maintenance_costs').update({ status }).eq('id', req.params.maintenanceId).eq('user_id', req.userId).select();
+    if (!mw.canTransitionSettlementStatus(credit.status, status)) {
+      return badRequest(res, `Cannot move a "${credit.status}" settlement to "${status || 'that state'}"`);
+    }
+
+    if (status === 'cancelled') {
+      // Conditioned on the 'pending' status just read -- if a concurrent
+      // request already moved this row, zero rows come back instead of
+      // silently overwriting whatever that other request just did.
+      const { data, error } = await supabase.from('rent_credits').update({ status: 'cancelled' }).eq('id', credit.id).eq('status', 'pending').select();
+      if (error) throw error;
+      if (!data || data.length === 0) {
+        return res.status(409).json({ error: 'This settlement was already updated. Refresh and try again.' });
+      }
+      return res.json(data[0]);
+    }
+
+    // status === 'applied'
+    const { settlement_method, settlement_reference, applied_payment_id } = req.body;
+    if (!mw.isValidSettlementMethod(settlement_method) || !settlement_method) {
+      return badRequest(res, 'settlement_method is required to apply a settlement');
+    }
+    if (!settlement_reference || !String(settlement_reference).trim()) {
+      return badRequest(res, 'settlement_reference is required to apply a settlement');
+    }
+
+    let paymentId = null;
+    if (credit.type === 'rent_credit') {
+      if (!applied_payment_id) return badRequest(res, 'applied_payment_id is required to apply a rent credit');
+      const { data: payment } = await supabase.from('payments').select('id, property_id, tenant_id, period').eq('id', applied_payment_id).eq('user_id', req.userId).maybeSingle();
+      if (!mw.paymentReconciles({ payment, propertyId: credit.property_id, tenantId: credit.tenant_id, applicablePeriod: credit.applicable_period })) {
+        return badRequest(res, 'applied_payment_id does not match this credit\'s property, tenant, and period');
+      }
+      paymentId = payment.id;
+    }
+
+    // Same conditional-write guard as the cancel branch above.
+    const { data, error } = await supabase.from('rent_credits').update({
+      status: 'applied', settlement_method, settlement_reference: String(settlement_reference).trim(),
+      settled_by: req.userId, settled_at: new Date().toISOString(),
+      applied_payment_id: paymentId
+    }).eq('id', credit.id).eq('status', 'pending').select();
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      return res.status(409).json({ error: 'This settlement was already updated. Refresh and try again.' });
+    }
+    res.json(data[0]);
+  } catch (err) {
+    unexpectedError('PATCH /api/rent-credits/:id', err, res);
+  }
+});
+
+// OWNER: read-only aggregation for the year-end/property maintenance
+// summary -- grouped in JS from the same maintenance_costs/rent_credits rows
+// already scoped to this property, no new schema.
+app.get('/api/properties/:propertyId/maintenance/summary', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).maybeSingle();
+    if (!property) return notFound(res);
+    const [{ data: costs }, { data: credits }] = await Promise.all([
+      supabase.from('maintenance_costs').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId),
+      supabase.from('rent_credits').select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId)
+    ]);
+    const byYear = {};
+    const byCategory = {};
+    const byVendor = {};
+    let totalSpend = 0, tenantPaid = 0, ownerPaid = 0, openCount = 0;
+    for (const c of (costs || [])) {
+      const year = (c.cost_date || c.created_at || '').slice(0, 4) || 'unknown';
+      byYear[year] = (byYear[year] || 0) + Number(c.amount || 0);
+      const cat = c.category || 'uncategorized';
+      byCategory[cat] = (byCategory[cat] || 0) + Number(c.amount || 0);
+      const vendorKey = c.vendor_id || c.vendor_name || 'unspecified';
+      byVendor[vendorKey] = (byVendor[vendorKey] || 0) + Number(c.amount || 0);
+      totalSpend += Number(c.amount || 0);
+      if (c.paid_by === 'tenant') tenantPaid += Number(c.amount || 0);
+      if (c.paid_by === 'owner') ownerPaid += Number(c.amount || 0);
+      if (!mw.isTerminalRequestStatus(c.request_status)) openCount++;
+    }
+    const pendingCredits = (credits || []).filter(c => c.status === 'pending');
+    res.json({
+      totalSpend, tenantPaid, ownerPaid,
+      reimbursed: (credits || []).filter(c => c.type === 'reimbursement' && c.status === 'applied').reduce((s, c) => s + Number(c.amount), 0),
+      byYear, byCategory, byVendor,
+      pendingCreditsTotal: pendingCredits.reduce((s, c) => s + Number(c.amount), 0),
+      pendingCreditsCount: pendingCredits.length,
+      openIssueCount: openCount
+    });
+  } catch (err) {
+    unexpectedError('GET /api/properties/:propertyId/maintenance/summary', err, res);
+  }
+});
+
+// ===== NOTIFICATIONS (Phase 1B) =====
+// Rows are written exclusively by jobs/runReminders.js (a standalone script,
+// not any HTTP route -- there is no "create notification" endpoint here by
+// design). Every query below is scoped to (recipient_user_id = req.userId
+// AND recipient_role = '<owner|tenant>') -- never accepts a recipient id
+// from the client. Default lists/counts exclude dismissed/snoozed/
+// invalidated; a snoozed row only becomes visible again once the daily job
+// flips it back to unread (see reminders.js) -- no route re-derives that
+// decision independently. The selected column list on every read
+// deliberately excludes source_type/source_id/dedupe_key/invalidation_
+// reason/invalidated_at/recipient_user_id/recipient_role -- internal
+// bookkeeping the recipient doesn't need and shouldn't see.
+const NOTIFICATION_SAFE_COLUMNS = 'id, property_id, category, title, body, deep_link, status, event_date, scheduled_for, offset_label, created_at, read_at, dismissed_at, snoozed_until';
+
+app.get('/api/notifications', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('notifications').select(NOTIFICATION_SAFE_COLUMNS)
+      .eq('recipient_user_id', req.userId).eq('recipient_role', 'owner')
+      .in('status', ['unread', 'read'])
+      .order('scheduled_for', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    unexpectedError('GET /api/notifications', err, res);
+  }
+});
+
+app.get('/api/notifications/unread-count', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const { count, error } = await supabase.from('notifications').select('id', { count: 'exact', head: true })
+      .eq('recipient_user_id', req.userId).eq('recipient_role', 'owner').eq('status', 'unread');
+    if (error) throw error;
+    res.json({ unread_count: count || 0 });
+  } catch (err) {
+    unexpectedError('GET /api/notifications/unread-count', err, res);
+  }
+});
+
+app.get('/api/tenant/notifications', verifyToken, async (req, res) => {
+  try {
+    const tenant = await resolveOwnTenant(req);
+    if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
+    const { data, error } = await supabase.from('notifications').select(NOTIFICATION_SAFE_COLUMNS)
+      .eq('recipient_user_id', req.userId).eq('recipient_role', 'tenant')
+      .in('status', ['unread', 'read'])
+      .order('scheduled_for', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    unexpectedError('GET /api/tenant/notifications', err, res);
+  }
+});
+
+app.get('/api/tenant/notifications/unread-count', verifyToken, async (req, res) => {
+  try {
+    const tenant = await resolveOwnTenant(req);
+    if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
+    const { count, error } = await supabase.from('notifications').select('id', { count: 'exact', head: true })
+      .eq('recipient_user_id', req.userId).eq('recipient_role', 'tenant').eq('status', 'unread');
+    if (error) throw error;
+    res.json({ unread_count: count || 0 });
+  } catch (err) {
+    unexpectedError('GET /api/tenant/notifications/unread-count', err, res);
+  }
+});
+
+// Shared by both roles -- ownership is enforced by recipient_user_id =
+// req.userId alone (a user's own id already belongs to exactly one role's
+// rows, so no separate role check is needed here). Closed transition set:
+// unread/read -> read|dismissed|snoozed only; dismissed and invalidated are
+// terminal; no client request can ever set status to 'invalidated' (it's
+// not in the accepted values below at all).
+app.patch('/api/notifications/:id', verifyToken, async (req, res) => {
+  try {
+    const { data: existing } = await supabase.from('notifications').select('*').eq('id', req.params.id).eq('recipient_user_id', req.userId).maybeSingle();
+    if (!existing) return notFound(res);
+
+    const { status, snoozed_until } = req.body;
+    if (!['read', 'dismissed', 'snoozed'].includes(status)) {
+      return badRequest(res, 'status must be read, dismissed, or snoozed');
+    }
+    if (!['unread', 'read'].includes(existing.status)) {
+      return badRequest(res, `Cannot move a "${existing.status}" notification to "${status}"`);
+    }
+
+    const allowed = { status };
+    if (status === 'read') {
+      allowed.read_at = new Date().toISOString();
+    } else if (status === 'dismissed') {
+      allowed.dismissed_at = new Date().toISOString();
+    } else {
+      const todayIST = todayISOInTimezone();
+      if (!snoozed_until || !/^\d{4}-\d{2}-\d{2}$/.test(snoozed_until) || snoozed_until <= todayIST) {
+        return badRequest(res, 'snoozed_until must be a future date (YYYY-MM-DD, Asia/Kolkata)');
+      }
+      allowed.snoozed_until = snoozed_until;
+    }
+
+    const { data, error } = await supabase.from('notifications').update(allowed).eq('id', existing.id).select(NOTIFICATION_SAFE_COLUMNS);
     if (error) throw error;
     res.json(data[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    unexpectedError('PATCH /api/notifications/:id', err, res);
+  }
+});
+
+// ===== TENANT-FACING MAINTENANCE REPORTING =====
+// Identity is always resolved server-side via login_user_id -- the same
+// pattern as every other /api/tenant/* route in this file. tenant_id,
+// property_id, and user_id (the landlord) are never accepted from the
+// request body on any of these three routes.
+
+async function resolveOwnTenant(req) {
+  const { data: tenant } = await supabase.from('tenants').select('id, property_id, user_id').eq('login_user_id', req.userId).eq('is_active', true).maybeSingle();
+  return tenant || null;
+}
+
+// Uploads a validated evidence batch, tracking every path it successfully
+// writes so a later failure (another file, or the final DB write) can clean
+// up everything from this request rather than leaving orphaned objects.
+async function uploadEvidenceBatch(files, { propertyId, maintenanceId }) {
+  const uploaded = [];
+  for (const f of files) {
+    const path = mw.buildEvidencePath({ propertyId, maintenanceId, uniqueId: crypto.randomUUID(), filename: f.originalname });
+    const { error } = await supabase.storage.from('documents').upload(path, f.buffer, { contentType: f.mimetype });
+    if (error) {
+      await cleanupEvidence(uploaded);
+      throw Object.assign(new Error('Evidence upload failed'), { isUploadFailure: true });
+    }
+    uploaded.push({ path, mimetype: f.mimetype, original_name: mw.sanitizeFilename(f.originalname), uploaded_at: new Date().toISOString() });
+  }
+  return uploaded;
+}
+
+async function cleanupEvidence(entries) {
+  if (!entries || entries.length === 0) return;
+  try {
+    await supabase.storage.from('documents').remove(entries.map(e => e.path));
+  } catch (cleanupErr) {
+    // Never surfaced to the client -- the original error is what the caller
+    // reports; this is a best-effort background cleanup.
+    console.error('[evidence cleanup] failed to remove orphaned objects:', cleanupErr);
+  }
+}
+
+// Upload-first: evidence is uploaded to Storage BEFORE the maintenance_costs
+// row is inserted, using a maintenanceId generated up front. This guarantees
+// a failed upload never leaves a maintenance record behind with missing/
+// partial evidence -- there is nothing to compensate/delete, because nothing
+// is written to the DB until every file has already succeeded.
+app.post('/api/tenant/maintenance', verifyToken, upload.array('files', mw.MAX_EVIDENCE_FILES), handleUploadErrors, async (req, res) => {
+  let uploaded = [];
+  try {
+    const tenant = await resolveOwnTenant(req);
+    if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
+
+    const { description, appliance_id, urgency, requested_amount } = req.body;
+    if (!description || !description.trim()) return badRequest(res, 'Description required');
+    if (!mw.isValidUrgency(urgency)) return badRequest(res, 'urgency must be low, normal, or high');
+    if (!mw.isValidOptionalPositiveAmount(requested_amount)) return badRequest(res, 'requested_amount must be a positive number');
+    if (appliance_id) {
+      const { data: appl } = await supabase.from('appliances').select('id').eq('id', appliance_id).eq('property_id', tenant.property_id).eq('user_id', tenant.user_id).maybeSingle();
+      if (!appl) return badRequest(res, 'appliance_id does not belong to your property');
+    }
+
+    const batchCheck = mw.validateEvidenceBatch(req.files);
+    if (!batchCheck.valid) return badRequest(res, batchCheck.error);
+
+    const maintenanceId = crypto.randomUUID();
+
+    if (req.files && req.files.length > 0) {
+      uploaded = await uploadEvidenceBatch(req.files, { propertyId: tenant.property_id, maintenanceId });
+    }
+
+    const row = {
+      id: maintenanceId,
+      property_id: tenant.property_id, user_id: tenant.user_id, tenant_id: tenant.id,
+      description: description.trim(), amount: 0, paid_by: 'tenant', status: 'pending',
+      request_status: requested_amount ? 'awaiting_approval' : 'reported',
+      reported_by: 'tenant',
+      appliance_id: appliance_id || null,
+      urgency: urgency || null,
+      requested_amount: requested_amount ? parseFloat(requested_amount) : null,
+      evidence_urls: uploaded
+    };
+    const { data: created, error } = await supabase.from('maintenance_costs').insert([row]).select();
+    if (error) { await cleanupEvidence(uploaded); throw error; }
+
+    res.status(201).json(created[0]);
+  } catch (err) {
+    if (err && err.isUploadFailure) return badRequest(res, 'Could not upload one or more evidence files');
+    unexpectedError('POST /api/tenant/maintenance', err, res);
+  }
+});
+
+app.get('/api/tenant/maintenance', verifyToken, async (req, res) => {
+  try {
+    const tenant = await resolveOwnTenant(req);
+    if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
+    const { data, error } = await supabase.from('maintenance_costs').select('*').eq('tenant_id', tenant.id).order('cost_date', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    unexpectedError('GET /api/tenant/maintenance', err, res);
+  }
+});
+
+// TENANT: edit description and/or append evidence to their OWN report,
+// only while it's still 'reported' or 'awaiting_approval' (once the owner
+// has acted on it, it's locked from the tenant's side too -- same
+// terminal-lock posture as the owner route, just gated on a different set
+// of statuses since the tenant shouldn't edit something already decided).
+app.patch('/api/tenant/maintenance/:id', verifyToken, upload.array('files', mw.MAX_EVIDENCE_FILES), handleUploadErrors, async (req, res) => {
+  let uploaded = [];
+  try {
+    const tenant = await resolveOwnTenant(req);
+    if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
+
+    // Ownership lookup happens before any Storage call. Multer has already
+    // parsed the multipart body into req.files by this point (that's
+    // unavoidable middleware ordering) -- but no supabase.storage upload
+    // has been attempted yet, and none will be if this check fails.
+    const { data: existing } = await supabase.from('maintenance_costs').select('*').eq('id', req.params.id).eq('tenant_id', tenant.id).maybeSingle();
+    if (!existing) return notFound(res);
+    if (!['reported', 'awaiting_approval'].includes(existing.request_status)) {
+      return badRequest(res, 'This request has already been reviewed and can no longer be edited.');
+    }
+
+    const batchCheck = mw.validateEvidenceBatch(req.files);
+    if (!batchCheck.valid) return badRequest(res, batchCheck.error);
+
+    const allowed = {};
+    if (req.body.description !== undefined) {
+      if (!req.body.description.trim()) return badRequest(res, 'Description cannot be empty');
+      allowed.description = req.body.description.trim();
+    }
+
+    if (req.files && req.files.length > 0) {
+      uploaded = await uploadEvidenceBatch(req.files, { propertyId: existing.property_id, maintenanceId: existing.id });
+      // Append, never overwrite, existing evidence entries.
+      allowed.evidence_urls = [...(existing.evidence_urls || []), ...uploaded];
+    }
+
+    if (Object.keys(allowed).length === 0) return badRequest(res, 'Nothing to update');
+    const { data, error } = await supabase.from('maintenance_costs').update(allowed).eq('id', existing.id).select();
+    if (error) { await cleanupEvidence(uploaded); throw error; }
+    res.json(data[0]);
+  } catch (err) {
+    if (err && err.isUploadFailure) return badRequest(res, 'Could not upload one or more evidence files');
+    unexpectedError('PATCH /api/tenant/maintenance/:id', err, res);
   }
 });
 
@@ -738,13 +1273,13 @@ app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
     if (e2) throw e2;
     const today = new Date().toISOString().slice(0, 10);
     const items = (obligations || []).map(o => {
-      const payment = (payments || []).find(p => p.obligation_id === o.id && p.status !== 'rejected') || null;
-      const lastDay = new Date(parseInt(month.slice(0, 4)), parseInt(month.slice(5, 7)), 0).getDate();
-      const dueDate = `${month}-${String(Math.min(o.due_day, lastDay)).padStart(2, '0')}`;
-      let status = 'due';
-      if (payment && payment.status === 'paid') status = 'paid';
-      else if (payment) status = 'pending_confirmation';
-      else if (dueDate < today) status = 'overdue';
+      // Canonical due-date computation (real last-day-of-month clamp) --
+      // also used by GET /api/tenant/home below, so both call sites agree.
+      const dueDate = dueDateForExplicitMonth(month, o.due_day);
+      // Payment-status decision extracted to reminders.computeDueStatus --
+      // byte-for-byte the same logic as before, now shared with the reminder
+      // job so both draw on one implementation, never two interpretations.
+      const { status, payment } = reminders.computeDueStatus({ obligationId: o.id, payments, dueDate, today });
       return { obligation: o, payment, status, due_date: dueDate };
     });
     res.json({ month, items });
@@ -918,16 +1453,22 @@ app.get('/api/properties/:propertyId/appliances', verifyToken, async (req, res) 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.patch('/api/appliances/:id', verifyToken, async (req, res) => {
+// condition_status changes only ever happen here -- explicitly, by the
+// owner -- never automatically from a maintenance-request state change.
+app.patch('/api/appliances/:id', verifyToken, requireOwner, async (req, res) => {
   try {
+    if (req.body.condition_status !== undefined && !mw.isValidConditionStatus(req.body.condition_status)) {
+      return badRequest(res, 'Invalid condition_status');
+    }
     const allowed = {};
-    for (const k of ['name', 'category', 'brand', 'model', 'serial_number', 'purchase_date', 'warranty_end', 'amc_provider', 'service_phone', 'notes']) {
+    for (const k of ['name', 'category', 'brand', 'model', 'serial_number', 'purchase_date', 'warranty_end', 'amc_provider', 'service_phone', 'notes', 'condition_status']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { data, error } = await supabase.from('appliances').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;
+    if (!data || data.length === 0) return notFound(res);
     res.json(data[0]);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { unexpectedError('PATCH /api/appliances/:id', err, res); }
 });
 
 app.delete('/api/appliances/:id', verifyToken, async (req, res) => {
@@ -1164,6 +1705,26 @@ app.delete('/api/vendors/:id', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// OWNER: approve/revoke a vendor. approved_at is server-stamped, never
+// accepted from the request -- true when approved flips to true, cleared
+// when it flips back to false.
+app.patch('/api/vendors/:id', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const allowed = {};
+    for (const k of ['name', 'trade', 'phone', 'notes']) {
+      if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    if (req.body.approved !== undefined) {
+      allowed.approved = !!req.body.approved;
+      allowed.approved_at = allowed.approved ? new Date().toISOString() : null;
+    }
+    const { data, error } = await supabase.from('vendors').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
+    if (error) throw error;
+    if (!data || data.length === 0) return notFound(res);
+    res.json(data[0]);
+  } catch (err) { unexpectedError('PATCH /api/vendors/:id', err, res); }
+});
+
 // ===== PHASE 2: TENANT SELF-SERVICE LINK (tenant fills their own details) =====
 
 app.post('/api/tenants/:tenantId/invite', verifyToken, async (req, res) => {
@@ -1252,12 +1813,13 @@ app.get('/api/tenant/home', verifyToken, async (req, res) => {
     ]);
     const today = new Date().toISOString().slice(0, 10);
     const dues = (obligations || []).map(o => {
-      const payment = (monthPayments || []).find(p => p.obligation_id === o.id && p.status !== 'rejected') || null;
-      const dueDate = `${month}-${String(Math.min(o.due_day || 5, 28)).padStart(2, '0')}`;
-      let status = 'due';
-      if (payment && payment.status === 'paid') status = 'paid';
-      else if (payment) status = 'pending_confirmation';
-      else if (dueDate < today) status = 'overdue';
+      // Now uses the same canonical due-date computation as /dues above
+      // (real last-day-of-month clamp) -- this call site previously
+      // hardcoded 28, which was silently wrong for due_day 29-31 in any
+      // month longer than February. The `|| 5` defensive default for a
+      // null due_day is preserved unchanged.
+      const dueDate = dueDateForExplicitMonth(month, o.due_day || 5);
+      const { status, payment } = reminders.computeDueStatus({ obligationId: o.id, payments: monthPayments, dueDate, today });
       return { obligation: o, payment, status, due_date: dueDate };
     });
     // Tenant Command Center: lease-end reminder, mirroring the owner dashboard's
@@ -1707,4 +2269,11 @@ app.patch('/api/whatsapp/facts/:id/apply', verifyToken, async (req, res) => {
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: 'Server error' }); });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT}`); });
+// Guarded so `require('./server')` from a test file (module.exports below)
+// never binds a real port or double-starts the server -- only `node
+// server.js` directly (the normal run path, unchanged) triggers listen().
+if (require.main === module) {
+  app.listen(PORT, () => { console.log(`✅ OMniNivas Backend running on port ${PORT}`); });
+}
+
+module.exports = app;
