@@ -1503,14 +1503,27 @@ app.get('/api/approvals', verifyToken, async (req, res) => {
 
     const relevantImportIds = (imports || []).filter(i => !propertyId || i.property_id === propertyId).map(i => i.id);
     let whatsappFacts = [];
+    // import_id -> seq -> raw message ts. One query for every relevant
+    // import (relevantImportIds is already owner/property-scoped above),
+    // not one query per fact -- avoids an N+1 pattern for what could be a
+    // long approval queue.
+    let messageTsByKey = {};
     if (relevantImportIds.length > 0) {
       const { data: facts, error: e6 } = await supabase.from('whatsapp_extracted_facts')
-        .select('id, import_id, category, fact_type, value, confidence, evidence, status, owner_edited_value, applied_at')
+        .select('id, import_id, category, fact_type, value, confidence, evidence, status, owner_edited_value, applied_at, message_seq')
         .in('import_id', relevantImportIds)
         .in('category', ['payment', 'deposit', 'maintenance', 'utility_cost']);
       if (e6) throw e6;
       // Not yet reviewed, or reviewed but not yet written into a real record.
       whatsappFacts = (facts || []).filter(f => f.status === 'pending' || (['approved', 'edited'].includes(f.status) && !f.applied_at));
+
+      if (whatsappFacts.length > 0) {
+        const { data: msgs, error: e7 } = await supabase.from('whatsapp_messages')
+          .select('import_id, seq, ts')
+          .in('import_id', relevantImportIds);
+        if (e7) throw e7;
+        messageTsByKey = Object.fromEntries((msgs || []).map(m => [`${m.import_id}:${m.seq}`, m.ts]));
+      }
     }
     const importPropertyById = new Map((imports || []).map(i => [i.id, i.property_id]));
 
@@ -1537,7 +1550,10 @@ app.get('/api/approvals', verifyToken, async (req, res) => {
       ...whatsappFacts.map(f => ({
         type: 'whatsapp_fact', id: f.id, property_name: propertyName(importPropertyById.get(f.import_id)),
         category: f.category, fact_type: f.fact_type, value: f.value, owner_edited_value: f.owner_edited_value,
-        confidence: f.confidence, evidence: f.evidence, status: f.status, applied_at: f.applied_at || null
+        confidence: f.confidence, evidence: f.evidence, status: f.status, applied_at: f.applied_at || null,
+        // null when the source message row can't be found (e.g. deleted) --
+        // the card omits the date line entirely rather than showing a gap.
+        message_ts: f.message_seq != null ? (messageTsByKey[`${f.import_id}:${f.message_seq}`] || null) : null
       }))
     ];
 

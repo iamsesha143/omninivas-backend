@@ -272,16 +272,88 @@ test('approvals: a pending WhatsApp financial fact appears; a rejected one and a
   mockDb.__queue('whatsapp_imports', { data: [{ id: 'imp-1', property_id: 'prop-1' }], error: null });
   mockDb.__queue('whatsapp_extracted_facts', {
     data: [
-      { id: 'f-pending', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: '₹15000 paid', confidence: 0.9, evidence: 'rent paid', status: 'pending', owner_edited_value: null, applied_at: null },
-      { id: 'f-rejected', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: 'x', confidence: 0.5, evidence: 'x', status: 'rejected', owner_edited_value: null, applied_at: null },
-      { id: 'f-applied', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: 'x', confidence: 0.9, evidence: 'x', status: 'approved', owner_edited_value: null, applied_at: '2026-08-01T00:00:00Z' }
+      { id: 'f-pending', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: '₹15000 paid', confidence: 0.9, evidence: 'rent paid', status: 'pending', owner_edited_value: null, applied_at: null, message_seq: 5 },
+      { id: 'f-rejected', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: 'x', confidence: 0.5, evidence: 'x', status: 'rejected', owner_edited_value: null, applied_at: null, message_seq: 6 },
+      { id: 'f-applied', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: 'x', confidence: 0.9, evidence: 'x', status: 'approved', owner_edited_value: null, applied_at: '2026-08-01T00:00:00Z', message_seq: 7 }
     ], error: null
   });
+  mockDb.__queue('whatsapp_messages', { data: [{ import_id: 'imp-1', seq: 5, ts: '05/08/2026, 10:00 am' }], error: null });
 
   const res = await api('/api/approvals', ownerToken);
   const facts = res.body.items.filter(i => i.type === 'whatsapp_fact');
   assert.equal(facts.length, 1);
   assert.equal(facts[0].id, 'f-pending');
+  assert.equal(facts[0].message_ts, '05/08/2026, 10:00 am', 'message_ts resolved from the matching whatsapp_messages row');
+});
+
+test('approvals: message_ts is null (not thrown, not omitted from the item) when the source message row is unavailable', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('whatsapp_imports', { data: [{ id: 'imp-1', property_id: 'prop-1' }], error: null });
+  mockDb.__queue('whatsapp_extracted_facts', {
+    data: [{ id: 'f-1', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: '₹15000', confidence: 0.9, evidence: 'x', status: 'pending', owner_edited_value: null, applied_at: null, message_seq: 42 }],
+    error: null
+  });
+  // No message with seq 42 exists (e.g. the message was later removed).
+  mockDb.__queue('whatsapp_messages', { data: [{ import_id: 'imp-1', seq: 1, ts: 'some other message' }], error: null });
+
+  const res = await api('/api/approvals', ownerToken);
+  assert.equal(res.status, 200);
+  const fact = res.body.items.find(i => i.type === 'whatsapp_fact');
+  assert.equal(fact.message_ts, null);
+});
+
+test('approvals: exactly one whatsapp_messages query is made regardless of how many facts need a lookup (no N+1)', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('whatsapp_imports', { data: [{ id: 'imp-1', property_id: 'prop-1' }], error: null });
+  mockDb.__queue('whatsapp_extracted_facts', {
+    data: [
+      { id: 'f-1', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: 'a', confidence: 0.9, evidence: 'a', status: 'pending', owner_edited_value: null, applied_at: null, message_seq: 1 },
+      { id: 'f-2', import_id: 'imp-1', category: 'deposit', fact_type: 'deposit_paid', value: 'b', confidence: 0.9, evidence: 'b', status: 'pending', owner_edited_value: null, applied_at: null, message_seq: 2 },
+      { id: 'f-3', import_id: 'imp-1', category: 'utility_cost', fact_type: 'electricity_cost', value: 'c', confidence: 0.9, evidence: 'c', status: 'pending', owner_edited_value: null, applied_at: null, message_seq: 3 }
+    ], error: null
+  });
+  // Only ONE whatsapp_messages response is queued -- if the route queried it
+  // once per fact (N+1), the second/third dequeue would throw and this test
+  // would fail with "no response queued for table whatsapp_messages".
+  mockDb.__queue('whatsapp_messages', { data: [{ import_id: 'imp-1', seq: 1, ts: 't1' }, { import_id: 'imp-1', seq: 2, ts: 't2' }, { import_id: 'imp-1', seq: 3, ts: 't3' }], error: null });
+
+  const res = await api('/api/approvals', ownerToken);
+  assert.equal(res.status, 200);
+  const facts = res.body.items.filter(i => i.type === 'whatsapp_fact');
+  assert.equal(facts.length, 3);
+  assert.deepEqual(facts.map(f => f.message_ts).sort(), ['t1', 't2', 't3']);
+});
+
+test('approvals: whatsapp facts from an import attached to a different property are excluded when filtering by property_id', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1' }], error: null }); // ownership check for property_id=prop-1
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P1' }, { id: 'prop-2', property_name: 'P2' }], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  // Two imports, one per property -- the route's own JS-level filter
+  // (relevantImportIds) must keep only the one matching the requested
+  // property_id, so a fact under the OTHER property's import never appears.
+  mockDb.__queue('whatsapp_imports', { data: [{ id: 'imp-1', property_id: 'prop-1' }, { id: 'imp-2', property_id: 'prop-2' }], error: null });
+  mockDb.__queue('whatsapp_extracted_facts', {
+    data: [{ id: 'f-1', import_id: 'imp-1', category: 'payment', fact_type: 'rent_payment', value: 'a', confidence: 0.9, evidence: 'a', status: 'pending', owner_edited_value: null, applied_at: null, message_seq: 1 }],
+    error: null
+  });
+  mockDb.__queue('whatsapp_messages', { data: [{ import_id: 'imp-1', seq: 1, ts: 't1' }], error: null });
+
+  const res = await api('/api/approvals?property_id=prop-1', ownerToken);
+  assert.equal(res.status, 200);
+  const facts = res.body.items.filter(i => i.type === 'whatsapp_fact');
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0].id, 'f-1');
 });
 
 test('approvals: non-financial WhatsApp categories (e.g. person, vendor) are never included', async () => {
