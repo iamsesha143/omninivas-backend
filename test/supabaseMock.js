@@ -56,7 +56,13 @@ function createMockSupabase() {
           remove: async (paths) => {
             storage.removed.push(...paths);
             return { data: paths, error: null };
-          }
+          },
+          // Used by GET /api/properties/:propertyId/documents (server.js).
+          // Always returns an empty listing -- no existing test exercises
+          // that route's file-listing behavior, only that routes calling
+          // .list() don't crash for lack of a mock.
+          list: async () => ({ data: [], error: null }),
+          createSignedUrl: async (path) => ({ data: { signedUrl: `https://mock-signed-url.test/${path}` }, error: null })
         };
       }
     },

@@ -16,6 +16,7 @@ const os = require('os');
 const rateLimit = require('express-rate-limit');
 const { Redis } = require('@upstash/redis');
 const mw = require('./maintenanceWorkflow');
+const uploadValidation = require('./uploadValidation');
 const reminders = require('./reminders');
 const { todayISOInTimezone, dueDateForExplicitMonth } = require('./dateUtils');
 
@@ -559,16 +560,8 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
 app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
-    // Duplicate guard: same filename + same byte size already present for this
-    // property. Cheap and safe -- a real content hash would be more precise but
-    // this catches the actual "uploaded it twice" case without extra deps.
-    const { data: existing } = await supabase.storage.from('documents').list(`properties/${req.params.propertyId}`, { limit: 100 });
-    const dupe = (existing || []).find(f => {
-      const m = f.name.match(/^deed_\d+_(.+)$/);
-      const title = m ? m[1] : null;
-      return title && title.toLowerCase() === (req.file.originalname || '').toLowerCase() && f.metadata?.size === req.file.size;
-    });
-    if (dupe) return res.status(409).json({ error: 'This document appears to already be uploaded for this property.' });
+    const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.DOCUMENT_UPLOAD_RULE);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
     // The original filename is encoded straight into the storage key (Supabase
     // Storage's .list() doesn't reliably surface custom upload metadata) so the
     // listing route below can recover a real title instead of a bare timestamp.
@@ -610,6 +603,8 @@ app.post('/api/properties/:propertyId/tenants/:tenantId/documents/:docType', ver
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
     if (!['aadhar', 'pan', 'id_proof'].includes(req.params.docType)) return res.status(400).json({ error: 'Invalid doc type' });
+    const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.DOCUMENT_UPLOAD_RULE);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
     const fileName = `tenants/${req.params.tenantId}/${req.params.docType}_${Date.now()}`;
     const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype, metadata: { user_id: req.userId, tenant_id: req.params.tenantId } });
     if (error) throw error;
@@ -1097,6 +1092,20 @@ async function cleanupEvidence(entries) {
   }
 }
 
+// Same best-effort-only posture as cleanupEvidence above, for the F1
+// single-file upload routes (payment proof, handover item photo): if the
+// storage upload succeeds but the subsequent database write fails, this
+// removes the just-uploaded object so the request's honest failure never
+// leaves an orphaned file with nothing in the DB referencing it. Never
+// surfaced to the client -- the original DB error is what gets reported.
+async function rollbackUploadedFile(path) {
+  try {
+    await supabase.storage.from('documents').remove([path]);
+  } catch (cleanupErr) {
+    console.error('[upload rollback] failed to remove orphaned object:', cleanupErr);
+  }
+}
+
 // Upload-first: evidence is uploaded to Storage BEFORE the maintenance_costs
 // row is inserted, using a maintenanceId generated up front. This guarantees
 // a failed upload never leaves a maintenance record behind with missing/
@@ -1292,6 +1301,8 @@ app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
 app.post('/api/properties/:propertyId/obligations/:obligationId/proof', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.DOCUMENT_UPLOAD_RULE);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
     const month = /^\d{4}-\d{2}$/.test(req.body.month || '') ? req.body.month : new Date().toISOString().slice(0, 7);
     const { data: obligation, error: oErr } = await supabase.from('obligations').select('*')
       .eq('id', req.params.obligationId).eq('user_id', req.userId).single();
@@ -1321,7 +1332,7 @@ app.post('/api/properties/:propertyId/obligations/:obligationId/proof', verifyTo
       proof_url: fileName,
       utr_number: extracted.utr || null
     }]).select();
-    if (error) throw error;
+    if (error) { await rollbackUploadedFile(fileName); throw error; }
     res.status(201).json({ payment: data[0], extracted });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1483,8 +1494,15 @@ app.delete('/api/appliances/:id', verifyToken, async (req, res) => {
 app.post('/api/properties/:propertyId/appliances/scan', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.DOCUMENT_UPLOAD_RULE);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
     const fileName = `appliances/${req.params.propertyId}/bill_${Date.now()}`;
-    await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype }).catch(() => {});
+    // Previously .catch(() => {}) swallowed a storage failure and still
+    // returned bill_url as if the file existed. A failed save is now an
+    // honest failure -- the OCR-suggestion feature isn't worth returning
+    // fields that reference a bill image that was never actually stored.
+    const { error: upErr } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
     let extracted = {};
     try {
       const text = await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype);
@@ -1582,8 +1600,14 @@ app.post('/api/handover/:id/items', verifyToken, upload.single('photo'), async (
     if (!b.item_name) return res.status(400).json({ error: 'item_name required' });
     let photo_url = null;
     if (req.file) {
+      const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.PHOTO_UPLOAD_RULE);
+      if (!validation.valid) return res.status(400).json({ error: validation.error });
       photo_url = `handover/${handover.property_id}/${handover.id}/${Date.now()}`;
-      await supabase.storage.from('documents').upload(photo_url, req.file.buffer, { contentType: req.file.mimetype }).catch(() => {});
+      // Previously .catch(() => {}) swallowed a storage failure and still
+      // created the handover_items row with a photo_url pointing at nothing
+      // -- exactly the false-success record this slice exists to prevent.
+      const { error: upErr } = await supabase.storage.from('documents').upload(photo_url, req.file.buffer, { contentType: req.file.mimetype });
+      if (upErr) throw upErr;
     }
     const row = {
       handover_id: handover.id, appliance_id: b.appliance_id || null,
@@ -1591,7 +1615,7 @@ app.post('/api/handover/:id/items', verifyToken, upload.single('photo'), async (
       photo_url, notes: b.notes || null
     };
     const { data, error } = await supabase.from('handover_items').insert([row]).select();
-    if (error) throw error;
+    if (error) { if (photo_url) await rollbackUploadedFile(photo_url); throw error; }
     const item = data[0];
     if (item.photo_url) {
       const { data: signed } = await supabase.storage.from('documents').createSignedUrl(item.photo_url, 3600);
@@ -1876,13 +1900,19 @@ app.patch('/api/tenant/me', verifyToken, async (req, res) => {
 app.post('/api/tenant/obligations/:obligationId/proof', verifyToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
+    const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.DOCUMENT_UPLOAD_RULE);
+    if (!validation.valid) return res.status(400).json({ error: validation.error });
     const { data: tenant } = await supabase.from('tenants').select('id,property_id,user_id').eq('login_user_id', req.userId).maybeSingle();
     if (!tenant) return res.status(403).json({ error: 'No tenancy linked to this login' });
     const { data: obligation } = await supabase.from('obligations').select('*').eq('id', req.params.obligationId).eq('property_id', tenant.property_id).single();
     if (!obligation) return res.status(404).json({ error: 'Bill not found' });
     const month = /^\d{4}-\d{2}$/.test(req.body.month || '') ? req.body.month : new Date().toISOString().slice(0, 7);
     const fileName = `proofs/${tenant.property_id}/${obligation.id}_${month}_${Date.now()}`;
-    await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype }).catch(() => {});
+    // Previously .catch(() => {}) swallowed a storage failure and still
+    // inserted a payments row with proof_url pointing at nothing -- the same
+    // false-success bug fixed on the owner-side sibling route above.
+    const { error: upErr } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+    if (upErr) throw upErr;
     let extracted = { amount: null, date: null, utr: null };
     try { extracted = parsePaymentProof(await extractDocumentText(req.file.buffer, req.file.originalname, req.file.mimetype)); } catch (e) {}
     const { data, error } = await supabase.from('payments').insert([{
@@ -1892,7 +1922,7 @@ app.post('/api/tenant/obligations/:obligationId/proof', verifyToken, upload.sing
       payment_date: extracted.date || new Date().toISOString().slice(0, 10),
       status: 'pending', proof_url: fileName, utr_number: extracted.utr || null
     }]).select();
-    if (error) throw error;
+    if (error) { await rollbackUploadedFile(fileName); throw error; }
     res.status(201).json({ payment: data[0], extracted });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
