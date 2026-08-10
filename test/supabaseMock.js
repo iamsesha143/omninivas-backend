@@ -20,7 +20,7 @@ function createMockSupabase() {
 
   function makeBuilder(table) {
     const builder = {};
-    const chainMethods = ['select', 'eq', 'is', 'ilike', 'order', 'update', 'delete', 'maybeSingle', 'single', 'in', 'neq', 'lte', 'gte'];
+    const chainMethods = ['select', 'eq', 'is', 'ilike', 'order', 'update', 'delete', 'maybeSingle', 'single', 'in', 'neq', 'lte', 'gte', 'not'];
     for (const method of chainMethods) {
       builder[method] = () => builder;
     }

@@ -2292,10 +2292,17 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
       }
     }
 
+    // Portfolio Overview occupancy: a property counts as occupied when it has
+    // at least one active tenant. Reuses the `tenants` rows already fetched
+    // above (active-only) -- no extra query, dedup via Set since one property
+    // can have multiple active tenants.
+    const occupiedProperties = new Set((tenants || []).map(t => t.property_id)).size;
+
     res.json({
       totalProperties: props?.length || 0,
       totalTenants: tenants?.length || 0,
       totalRentPaid,
+      occupiedProperties,
       pendingMaintenanceCosts: pendingMaintenance,
       duesThisMonth: { month, total: (obligations || []).length, paid: duesPaid, pending: duesPending, overdue: duesOverdue },
       renewals: renewals.sort((a, b) => a.days_left - b.days_left),
