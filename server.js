@@ -279,12 +279,22 @@ app.post('/api/feedback', verifyToken, async (req, res) => {
   }
 });
 
+// No DB CHECK constraint yet (deliberately deferred -- see the property-type
+// preflight audit before that migration is proposed). This is the only
+// place values are currently constrained, matching the same client-safe-
+// validation-before-a-raw-DB-error pattern already used for feedback
+// categories.
+const PROPERTY_TYPES = ['residential', 'commercial', 'land'];
+
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, city, state, street_address, pincode, property_type, agreement_summary, deposit_suggested_total, agreement_start_date, agreement_months } = req.body;
 
     if (!property_name || !city || !state || !pincode) {
       return res.status(400).json({ error: 'Property name, city, state, and pincode required' });
+    }
+    if (property_type !== undefined && !PROPERTY_TYPES.includes(property_type)) {
+      return res.status(400).json({ error: `property_type must be one of: ${PROPERTY_TYPES.join(', ')}` });
     }
 
     // Duplicate guard: same owner, same name + pincode, not soft-deleted.
@@ -359,6 +369,9 @@ app.delete('/api/properties/:id', verifyToken, async (req, res) => {
 
 app.patch('/api/properties/:id', verifyToken, async (req, res) => {
   try {
+    if (req.body.property_type !== undefined && !PROPERTY_TYPES.includes(req.body.property_type)) {
+      return res.status(400).json({ error: `property_type must be one of: ${PROPERTY_TYPES.join(', ')}` });
+    }
     const allowed = {};
     for (const k of ['property_name', 'street_address', 'city', 'state', 'pincode', 'flat_number', 'society_name', 'property_type', 'agreement_start_date', 'agreement_months']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
