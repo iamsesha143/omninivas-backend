@@ -18,7 +18,7 @@ const { Redis } = require('@upstash/redis');
 const mw = require('./maintenanceWorkflow');
 const uploadValidation = require('./uploadValidation');
 const reminders = require('./reminders');
-const { todayISOInTimezone, dueDateForExplicitMonth } = require('./dateUtils');
+const { todayISOInTimezone, dueDateForExplicitMonth, daysInMonth } = require('./dateUtils');
 
 const app = express();
 
@@ -1328,6 +1328,210 @@ app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
     res.json({ month, items });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== FINANCIAL COMMAND CENTER (Cash Flow slice) =====
+
+// A payment's `period` should always be set (YYYY-MM-01), but the WhatsApp
+// "record as a payment" apply flow historically didn't send it, leaving
+// period NULL on some already-settled rows. Rather than silently dropping
+// those from every cash-flow total, fall back to the month of payment_date.
+function paymentInMonth(payment, period, monthStart, monthEnd) {
+  if (payment.period) return payment.period === period;
+  return payment.payment_date >= monthStart && payment.payment_date <= monthEnd;
+}
+
+// Settled-only operating cash flow (received/paid/net), a 2-month "upcoming/
+// awaiting confirmation" window (reusing reminders.computeDueStatus -- no new
+// due-date logic), open maintenance issues, and deposit status read from the
+// existing tenant deposit columns (no new table). Property-aware: property_id
+// is ownership-checked server-side before any aggregation runs; omitted ->
+// portfolio-wide across every property this owner owns.
+app.get('/api/cashflow', verifyToken, async (req, res) => {
+  try {
+    const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : new Date().toISOString().slice(0, 7);
+    const propertyId = req.query.property_id || null;
+    if (propertyId) {
+      const { data: prop } = await supabase.from('properties').select('id')
+        .eq('id', propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+      if (!prop) return res.status(404).json({ error: 'Property not found' });
+    }
+    const [year, monthNum] = month.split('-').map(Number);
+    const period = `${month}-01`;
+    const monthStart = period;
+    const monthEnd = `${month}-${String(daysInMonth(year, monthNum)).padStart(2, '0')}`;
+    // monthNum (1-12) passed as JS Date's 0-indexed month arg lands on the
+    // 1st of the NEXT month -- also correctly rolls the year at December.
+    const nextMonthDate = new Date(Date.UTC(year, monthNum, 1));
+    const nextMonth = `${nextMonthDate.getUTCFullYear()}-${String(nextMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
+    const nextPeriod = `${nextMonth}-01`;
+    const [nyear, nmonthNum] = nextMonth.split('-').map(Number);
+    const nextMonthEnd = `${nextMonth}-${String(daysInMonth(nyear, nmonthNum)).padStart(2, '0')}`;
+
+    const scopeFilter = (q) => propertyId ? q.eq('property_id', propertyId) : q.eq('user_id', req.userId);
+
+    const [{ data: properties }, { data: obligations, error: e1 }, { data: payments, error: e2 }, { data: maintenance, error: e3 }, { data: tenants, error: e4 }] = await Promise.all([
+      supabase.from('properties').select('id, property_name').eq('user_id', req.userId).is('deleted_at', null),
+      scopeFilter(supabase.from('obligations').select('id, property_id, paid_by, label, type, amount, due_day').eq('user_id', req.userId).eq('active', true)),
+      scopeFilter(supabase.from('payments').select('id, property_id, amount, payment_date, period, status, tenant_id, obligation_id').eq('user_id', req.userId)),
+      scopeFilter(supabase.from('maintenance_costs').select('id, property_id, amount, cost_date, status, paid_by, description, vendor_name, request_status').eq('user_id', req.userId)),
+      scopeFilter(supabase.from('tenants').select('id, property_id, name, deposit_amount, deposit_paid_date, deposit_details, deposit_refunded_amount, deposit_refunded_date').eq('user_id', req.userId).eq('is_active', true))
+    ]);
+    if (e1) throw e1; if (e2) throw e2; if (e3) throw e3; if (e4) throw e4;
+
+    const propertyName = (id) => (properties || []).find(p => p.id === id)?.property_name || '';
+    const obligationsById = new Map((obligations || []).map(o => [o.id, o]));
+
+    // ---- Settled (status='paid' only -- pending/pending_confirmation/rejected never counted) ----
+    const settledPayments = (payments || []).filter(p => p.status === 'paid' && paymentInMonth(p, period, monthStart, monthEnd));
+    const settledMaintenance = (maintenance || []).filter(m => m.status === 'paid' && m.paid_by === 'owner' && m.cost_date >= monthStart && m.cost_date <= monthEnd);
+
+    let cashReceived = 0, ownerPaidObligationExpense = 0;
+    const transactions = [];
+    for (const p of settledPayments) {
+      const obligation = p.obligation_id ? obligationsById.get(p.obligation_id) : null;
+      // An obligation-linked 'paid' payment against an OWNER-paid obligation
+      // (e.g. the owner marking society maintenance paid) is the owner's own
+      // outflow, not income, even though it lives in the same table.
+      const isOwnerPaid = !!(obligation && obligation.paid_by === 'owner');
+      const label = obligation ? obligation.label : 'Payment';
+      if (isOwnerPaid) {
+        ownerPaidObligationExpense += Number(p.amount) || 0;
+        transactions.push({ date: p.payment_date, amount: Number(p.amount) || 0, direction: 'expense', label, property_name: propertyName(p.property_id), source: 'payment' });
+      } else {
+        cashReceived += Number(p.amount) || 0;
+        transactions.push({ date: p.payment_date, amount: Number(p.amount) || 0, direction: 'income', label, property_name: propertyName(p.property_id), source: 'payment' });
+      }
+    }
+    let maintenanceExpense = 0;
+    for (const m of settledMaintenance) {
+      maintenanceExpense += Number(m.amount) || 0;
+      transactions.push({ date: m.cost_date, amount: Number(m.amount) || 0, direction: 'expense', label: m.description || (m.vendor_name ? `Maintenance — ${m.vendor_name}` : 'Maintenance'), property_name: propertyName(m.property_id), source: 'maintenance' });
+    }
+    const expensesPaid = ownerPaidObligationExpense + maintenanceExpense;
+    transactions.sort((a, b) => (a.date < b.date ? 1 : -1));
+
+    // ---- Upcoming / awaiting confirmation: this month + next month only, never further ----
+    const today = todayISOInTimezone();
+    const buildUpcoming = (m, per, start, end) => {
+      const monthPayments = (payments || []).filter(p => paymentInMonth(p, per, start, end));
+      return (obligations || []).map(o => {
+        const dueDate = dueDateForExplicitMonth(m, o.due_day);
+        const { status, payment } = reminders.computeDueStatus({ obligationId: o.id, payments: monthPayments, dueDate, today });
+        return { obligation: o, payment, status, due_date: dueDate, month: m, property_name: propertyName(o.property_id) };
+      }).filter(item => item.status !== 'paid'); // already in the settled section above
+    };
+    const upcoming = [...buildUpcoming(month, period, monthStart, monthEnd), ...buildUpcoming(nextMonth, nextPeriod, nextPeriod, nextMonthEnd)];
+
+    // ---- Open maintenance: unresolved, shown regardless of month -- these
+    // aren't due-dated, so they don't belong blended into the month-based
+    // upcoming list above. ----
+    const openMaintenance = (maintenance || [])
+      .filter(m => m.request_status && !['resolved', 'rejected'].includes(m.request_status))
+      .map(m => ({ id: m.id, property_id: m.property_id, property_name: propertyName(m.property_id), amount: m.amount, cost_date: m.cost_date, description: m.description, vendor_name: m.vendor_name, request_status: m.request_status }));
+
+    // ---- Deposits held: existing tenants.deposit_* columns only, no ledger table ----
+    const deposits = (tenants || [])
+      .filter(t => t.deposit_amount)
+      .map(t => {
+        const agreed = Number(t.deposit_amount) || 0;
+        const refunded = Number(t.deposit_refunded_amount) || 0;
+        let status = 'awaiting_confirmation';
+        if (t.deposit_paid_date) status = refunded > 0 ? (refunded >= agreed ? 'refunded' : 'partially_refunded') : 'received';
+        return {
+          tenant_id: t.id, tenant_name: t.name, property_name: propertyName(t.property_id),
+          agreed_amount: agreed, received_date: t.deposit_paid_date || null, received_details: t.deposit_details || null,
+          refunded_amount: t.deposit_refunded_amount || null, refunded_date: t.deposit_refunded_date || null, status
+        };
+      });
+
+    res.json({
+      month, nextMonth, propertyId,
+      cashReceived, expensesPaid, netCashFlow: cashReceived - expensesPaid,
+      transactions: transactions.slice(0, 10),
+      upcoming, openMaintenance, deposits
+    });
+  } catch (err) {
+    console.error('[GET /api/cashflow]', err);
+    res.status(500).json({ error: 'Unable to load cash flow.' });
+  }
+});
+
+// Read-only aggregation of everything currently awaiting an explicit owner
+// decision. Deliberately NOT a new approval engine: every actual mutation
+// still goes through its own existing, already-authorized endpoint (PATCH
+// /api/payments/:id, PATCH .../maintenance/:maintenanceId, PATCH+apply
+// /api/whatsapp/facts/:id, PATCH /api/tenants/:id). This route only merges
+// four already-existing "pending" states into one list for display.
+app.get('/api/approvals', verifyToken, async (req, res) => {
+  try {
+    const propertyId = req.query.property_id || null;
+    if (propertyId) {
+      const { data: prop } = await supabase.from('properties').select('id')
+        .eq('id', propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+      if (!prop) return res.status(404).json({ error: 'Property not found' });
+    }
+    const scopeFilter = (q) => propertyId ? q.eq('property_id', propertyId) : q.eq('user_id', req.userId);
+
+    const [{ data: properties }, { data: tenants, error: e1 }, { data: obligations, error: e2 }, { data: pendingPayments, error: e3 }, { data: pendingMaintenance, error: e4 }, { data: imports, error: e5 }] = await Promise.all([
+      supabase.from('properties').select('id, property_name').eq('user_id', req.userId).is('deleted_at', null),
+      scopeFilter(supabase.from('tenants').select('id, property_id, name, deposit_amount, deposit_paid_date').eq('user_id', req.userId).eq('is_active', true)),
+      scopeFilter(supabase.from('obligations').select('id, label').eq('user_id', req.userId)),
+      scopeFilter(supabase.from('payments').select('id, property_id, amount, payment_date, tenant_id, obligation_id').eq('user_id', req.userId).eq('status', 'pending_confirmation')),
+      scopeFilter(supabase.from('maintenance_costs').select('id, property_id, amount, description, cost_date, vendor_name, request_status').eq('user_id', req.userId).in('request_status', ['reported', 'awaiting_approval'])),
+      supabase.from('whatsapp_imports').select('id, property_id').eq('user_id', req.userId)
+    ]);
+    if (e1) throw e1; if (e2) throw e2; if (e3) throw e3; if (e4) throw e4; if (e5) throw e5;
+
+    const propertyName = (id) => (properties || []).find(p => p.id === id)?.property_name || '';
+    const tenantsById = new Map((tenants || []).map(t => [t.id, t.name]));
+    const obligationLabel = (id) => (obligations || []).find(o => o.id === id)?.label || null;
+
+    const relevantImportIds = (imports || []).filter(i => !propertyId || i.property_id === propertyId).map(i => i.id);
+    let whatsappFacts = [];
+    if (relevantImportIds.length > 0) {
+      const { data: facts, error: e6 } = await supabase.from('whatsapp_extracted_facts')
+        .select('id, import_id, category, fact_type, value, confidence, evidence, status, owner_edited_value, applied_at')
+        .in('import_id', relevantImportIds)
+        .in('category', ['payment', 'deposit', 'maintenance', 'utility_cost']);
+      if (e6) throw e6;
+      // Not yet reviewed, or reviewed but not yet written into a real record.
+      whatsappFacts = (facts || []).filter(f => f.status === 'pending' || (['approved', 'edited'].includes(f.status) && !f.applied_at));
+    }
+    const importPropertyById = new Map((imports || []).map(i => [i.id, i.property_id]));
+
+    const items = [
+      ...(pendingPayments || []).map(p => ({
+        type: 'payment_confirmation', id: p.id, property_name: propertyName(p.property_id),
+        tenant_name: p.tenant_id ? (tenantsById.get(p.tenant_id) || null) : null,
+        label: obligationLabel(p.obligation_id) || 'Payment', amount: p.amount, date: p.payment_date
+      })),
+      ...(pendingMaintenance || []).map(m => ({
+        type: 'maintenance_approval', id: m.id, property_id: m.property_id, property_name: propertyName(m.property_id),
+        vendor_name: m.vendor_name || null, label: m.description, amount: m.amount, date: m.cost_date, request_status: m.request_status
+      })),
+      ...(tenants || []).filter(t => t.deposit_amount && !t.deposit_paid_date).map(t => ({
+        type: 'deposit_confirmation', id: t.id, tenant_id: t.id, tenant_name: t.name,
+        property_name: propertyName(t.property_id), amount: t.deposit_amount
+      })),
+      // Raw fields (value/owner_edited_value/applied_at), not pre-merged --
+      // this shape is passed straight into the existing FactCard component
+      // (src/index.jsx), which already knows how to render edited/pending
+      // state correctly and already owns the Approve/Edit/Reject/Apply
+      // actions against their real endpoints. Reusing it here, not
+      // reimplementing its logic.
+      ...whatsappFacts.map(f => ({
+        type: 'whatsapp_fact', id: f.id, property_name: propertyName(importPropertyById.get(f.import_id)),
+        category: f.category, fact_type: f.fact_type, value: f.value, owner_edited_value: f.owner_edited_value,
+        confidence: f.confidence, evidence: f.evidence, status: f.status, applied_at: f.applied_at || null
+      }))
+    ];
+
+    res.json({ items });
+  } catch (err) {
+    console.error('[GET /api/approvals]', err);
+    res.status(500).json({ error: 'Unable to load approvals.' });
   }
 });
 
