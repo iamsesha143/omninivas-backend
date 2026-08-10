@@ -245,6 +245,40 @@ app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+const FEEDBACK_CATEGORIES = ['bug', 'feature_request', 'question', 'other'];
+
+// In-app Help & Feedback (capture-only, no email/notification/review
+// workflow in this slice). Works for both owner and tenant tokens -- both
+// are rows in `users`, same dual-role pattern as GET /api/auth/me.
+// user_id/role always come from the verified token, never from the
+// request body, even if the client sends conflicting values for either.
+app.post('/api/feedback', verifyToken, async (req, res) => {
+  try {
+    const { category, message, page, app_version, property_name } = req.body;
+    if (!FEEDBACK_CATEGORIES.includes(category)) {
+      return res.status(400).json({ error: `category must be one of: ${FEEDBACK_CATEGORIES.join(', ')}` });
+    }
+    const trimmedMessage = typeof message === 'string' ? message.trim() : '';
+    if (trimmedMessage.length < 5 || trimmedMessage.length > 2000) {
+      return res.status(400).json({ error: 'message must be between 5 and 2000 characters' });
+    }
+    const row = {
+      user_id: req.userId,
+      role: req.role,
+      category,
+      message: trimmedMessage,
+      page: typeof page === 'string' ? page.trim().slice(0, 200) : null,
+      app_version: typeof app_version === 'string' ? app_version.trim().slice(0, 50) : null,
+      property_name: typeof property_name === 'string' ? property_name.trim().slice(0, 200) : null
+    };
+    const { data, error } = await supabase.from('feedback_submissions').insert([row]).select('id, created_at');
+    if (error) throw error;
+    res.status(201).json({ id: data[0].id, created_at: data[0].created_at });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not save your feedback. Please try again.' });
+  }
+});
+
 app.post('/api/properties', verifyToken, async (req, res) => {
   try {
     const { property_name, city, state, street_address, pincode, property_type, agreement_summary, deposit_suggested_total, agreement_start_date, agreement_months } = req.body;
