@@ -507,7 +507,7 @@ async function extractDocumentText(buffer, filename, mimetype) {
   }
 }
 
-const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText } = require('./parsers');
+const { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText, parseAgreementFactsFromText } = require('./parsers');
 const { summarizeAgreement, extractAgreementFacts, compareMoveInOut } = require('./llm');
 
 app.post('/api/extract/property', verifyToken, upload.single('file'), async (req, res) => {
@@ -520,26 +520,56 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
     // the structured clause facts below -- summarizeAgreement is a second call
     // for the prose text only (extractAgreementFacts can't produce that).
     const { summary } = await summarizeAgreement(text);
-    const facts = await extractAgreementFacts(text);
+    const aiFacts = await extractAgreementFacts(text);
+    // Deterministic regex extraction (parsers.js) runs unconditionally --
+    // unlike aiFacts above, it has no dependency on the AI gateway (confirmed
+    // dormant since 2026-08-03; see CLAUDE.md). Regex values win wherever
+    // present since they carry a verifiable source snippet (regexFacts.evidence);
+    // the AI facts fill in only what regex has no pattern for (painting_clause)
+    // or when the gateway happens to be configured and regex found nothing.
+    const regexFacts = parseAgreementFactsFromText(text);
+
+    const rentAmount = regexFacts.rent_amount ?? (aiFacts.skipped ? null : aiFacts.rent_amount);
+    const maintenancePayer = regexFacts.maintenance_payer ?? (aiFacts.skipped ? null : aiFacts.maintenance_payer);
+    const electricityPayer = regexFacts.electricity_payer ?? (aiFacts.skipped ? null : aiFacts.electricity_payer);
+    const depositTotal = regexFacts.deposit_total ?? (aiFacts.skipped ? null : aiFacts.deposit_total);
+    // AI fixtures (plain strings, no quantity) only ever fill in when regex
+    // found nothing at all -- never merged item-by-item with regex fixtures,
+    // to avoid a duplicate entry for the same physical item under two names.
+    const fixtures = regexFacts.fixtures.length > 0
+      ? regexFacts.fixtures
+      : (aiFacts.skipped ? [] : (aiFacts.fixtures || []).map(name => ({ name, quantity: 1 })));
+    const paintingClause = aiFacts.skipped ? null : aiFacts.painting_clause;
+
+    const hasAnyFact = rentAmount !== null || regexFacts.rent_due_day !== null || depositTotal !== null
+      || maintenancePayer !== null || electricityPayer !== null || paintingClause !== null || fixtures.length > 0;
+
     res.json({
       success: true, extractedData: propertyData, agreementSummary: summary,
       // skipped=true (missing key, short/unparsable text, or a failed call) simply
       // means no suggestion -- the frontend falls back to manual-only deposit entry.
-      depositSuggestion: (facts.skipped || facts.deposit_total === null) ? null : { total: facts.deposit_total, tenantCount: facts.tenant_count },
+      depositSuggestion: depositTotal === null ? null : {
+        total: depositTotal, tenantCount: aiFacts.skipped ? null : aiFacts.tenant_count, refundable: regexFacts.deposit_refundable
+      },
       // Additive: clause-level facts for the review step to show as verifiable,
-      // editable suggestions -- never auto-written anywhere (obligations still
-      // come from the owner's own manual setup, same as before this change).
-      agreementFacts: facts.skipped ? null : {
-        rentAmount: facts.rent_amount,
-        durationMonths: facts.duration_months,
-        maintenancePayer: facts.maintenance_payer,
-        electricityPayer: facts.electricity_payer,
-        paintingClause: facts.painting_clause,
+      // editable suggestions -- never auto-written anywhere; the owner's
+      // review-and-approve step (frontend) is what turns these into real
+      // tenant/deposit/obligation/appliance records, not this route.
+      agreementFacts: hasAnyFact ? {
+        rentAmount, rentDueDay: regexFacts.rent_due_day,
+        durationMonths: propertyData.agreement_months ?? (aiFacts.skipped ? null : aiFacts.duration_months),
+        maintenancePayer, electricityPayer, paintingClause,
+        depositTotal, depositRefundable: regexFacts.deposit_refundable,
         // Fittings/fixtures/appliances explicitly listed in the agreement --
         // maps to the move-in/appliances/handover area; the review step offers
         // a one-tap "add these to the appliance registry" action, never silent.
-        fixtures: facts.fixtures || []
-      }
+        fixtures,
+        // Exact source-text snippet per regex-found fact, for the review
+        // screen to show provenance ("why do we think this"). AI-sourced
+        // facts (when regex found nothing) have no snippet, since the AI
+        // gateway doesn't return one.
+        evidence: regexFacts.evidence
+      } : null
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to extract: ' + err.message });
@@ -1268,6 +1298,15 @@ app.post('/api/properties/:propertyId/obligations', verifyToken, async (req, res
     const { type, label, amount, due_day, paid_by } = req.body;
     if (!label) return res.status(400).json({ error: 'Label required (e.g. Rent, Electricity)' });
     if (paid_by && !['owner', 'tenant'].includes(paid_by)) return res.status(400).json({ error: 'paid_by must be owner or tenant' });
+    // Idempotency guard: creating an obligation with the same type+label for
+    // a property it's already active on (e.g. re-approving an agreement's
+    // rent/maintenance/electricity clauses) returns the existing row instead
+    // of a duplicate -- a no-op success, not an error, since re-approving the
+    // same fact isn't a mistake the owner needs to be told about.
+    const { data: dupe } = await supabase.from('obligations').select('*')
+      .eq('property_id', req.params.propertyId).eq('user_id', req.userId).eq('active', true)
+      .eq('type', type || 'other').ilike('label', (label || '').trim());
+    if (dupe && dupe.length > 0) return res.status(200).json(dupe[0]);
     const day = parseInt(due_day, 10);
     const { data, error } = await supabase.from('obligations').insert([{
       property_id: req.params.propertyId,
@@ -1349,10 +1388,15 @@ app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
 // A payment's `period` should always be set (YYYY-MM-01), but the WhatsApp
 // "record as a payment" apply flow historically didn't send it, leaving
 // period NULL on some already-settled rows. Rather than silently dropping
-// those from every cash-flow total, fall back to the month of payment_date.
-function paymentInMonth(payment, period, monthStart, monthEnd) {
-  if (payment.period) return payment.period === period;
-  return payment.payment_date >= monthStart && payment.payment_date <= monthEnd;
+// those from every cash-flow total, fall back to payment_date. Range-based
+// (not single-month) so the same function covers both the current-month view
+// and the multi-month year-to-date view -- periods are always stored as
+// first-of-month dates, so a single-month range (monthStart..monthEnd) still
+// only ever matches that one month's period, same as the old exact-equality
+// check this replaces.
+function paymentInRange(payment, rangeStart, rangeEnd) {
+  const d = payment.period || payment.payment_date;
+  return d >= rangeStart && d <= rangeEnd;
 }
 
 // Settled-only operating cash flow (received/paid/net), a 2-month "upcoming/
@@ -1396,39 +1440,71 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
     const propertyName = (id) => (properties || []).find(p => p.id === id)?.property_name || '';
     const obligationsById = new Map((obligations || []).map(o => [o.id, o]));
 
-    // ---- Settled (status='paid' only -- pending/pending_confirmation/rejected never counted) ----
-    const settledPayments = (payments || []).filter(p => p.status === 'paid' && paymentInMonth(p, period, monthStart, monthEnd));
-    const settledMaintenance = (maintenance || []).filter(m => m.status === 'paid' && m.paid_by === 'owner' && m.cost_date >= monthStart && m.cost_date <= monthEnd);
-
-    let cashReceived = 0, ownerPaidObligationExpense = 0;
-    const transactions = [];
-    for (const p of settledPayments) {
-      const obligation = p.obligation_id ? obligationsById.get(p.obligation_id) : null;
-      // An obligation-linked 'paid' payment against an OWNER-paid obligation
-      // (e.g. the owner marking society maintenance paid) is the owner's own
-      // outflow, not income, even though it lives in the same table.
-      const isOwnerPaid = !!(obligation && obligation.paid_by === 'owner');
-      const label = obligation ? obligation.label : 'Payment';
-      if (isOwnerPaid) {
-        ownerPaidObligationExpense += Number(p.amount) || 0;
-        transactions.push({ date: p.payment_date, amount: Number(p.amount) || 0, direction: 'expense', label, property_name: propertyName(p.property_id), source: 'payment' });
-      } else {
-        cashReceived += Number(p.amount) || 0;
-        transactions.push({ date: p.payment_date, amount: Number(p.amount) || 0, direction: 'income', label, property_name: propertyName(p.property_id), source: 'payment' });
+    // Settled-cash classification (status='paid' only -- pending/
+    // pending_confirmation/rejected never counted), parameterized by date
+    // range so the identical rule set drives both the current-month view and
+    // the year-to-date view below -- no duplicated classification logic
+    // between them, and nothing in the frontend re-derives this.
+    const classifySettled = (rangeStart, rangeEnd) => {
+      const settledPayments = (payments || []).filter(p => p.status === 'paid' && paymentInRange(p, rangeStart, rangeEnd));
+      const settledMaintenance = (maintenance || []).filter(m => m.status === 'paid' && m.paid_by === 'owner' && m.cost_date >= rangeStart && m.cost_date <= rangeEnd);
+      let cashReceived = 0, expensesPaid = 0;
+      const transactions = [];
+      const categoryTotalsMap = new Map();
+      const addCategory = (label, amount) => categoryTotalsMap.set(label, (categoryTotalsMap.get(label) || 0) + amount);
+      for (const p of settledPayments) {
+        const obligation = p.obligation_id ? obligationsById.get(p.obligation_id) : null;
+        // An obligation-linked 'paid' payment against an OWNER-paid obligation
+        // (e.g. the owner marking society maintenance paid) is the owner's own
+        // outflow, not income, even though it lives in the same table.
+        const isOwnerPaid = !!(obligation && obligation.paid_by === 'owner');
+        const label = obligation ? obligation.label : 'Payment';
+        const amt = Number(p.amount) || 0;
+        if (isOwnerPaid) {
+          expensesPaid += amt;
+          addCategory(label, amt);
+          transactions.push({ date: p.payment_date, amount: amt, direction: 'expense', label, property_name: propertyName(p.property_id), source: 'payment' });
+        } else {
+          cashReceived += amt;
+          transactions.push({ date: p.payment_date, amount: amt, direction: 'income', label, property_name: propertyName(p.property_id), source: 'payment' });
+        }
       }
-    }
-    let maintenanceExpense = 0;
-    for (const m of settledMaintenance) {
-      maintenanceExpense += Number(m.amount) || 0;
-      transactions.push({ date: m.cost_date, amount: Number(m.amount) || 0, direction: 'expense', label: m.description || (m.vendor_name ? `Maintenance — ${m.vendor_name}` : 'Maintenance'), property_name: propertyName(m.property_id), source: 'maintenance' });
-    }
-    const expensesPaid = ownerPaidObligationExpense + maintenanceExpense;
-    transactions.sort((a, b) => (a.date < b.date ? 1 : -1));
+      for (const m of settledMaintenance) {
+        const amt = Number(m.amount) || 0;
+        expensesPaid += amt;
+        addCategory('Maintenance', amt);
+        transactions.push({ date: m.cost_date, amount: amt, direction: 'expense', label: m.description || (m.vendor_name ? `Maintenance — ${m.vendor_name}` : 'Maintenance'), property_name: propertyName(m.property_id), source: 'maintenance' });
+      }
+      transactions.sort((a, b) => (a.date < b.date ? 1 : -1));
+      const categoryTotals = [...categoryTotalsMap.entries()].map(([label, amount]) => ({ label, amount })).sort((a, b) => b.amount - a.amount);
+      return { cashReceived, expensesPaid, netCashFlow: cashReceived - expensesPaid, transactions, categoryTotals };
+    };
+
+    const monthResult = classifySettled(monthStart, monthEnd);
+    const { cashReceived, expensesPaid, netCashFlow, transactions, categoryTotals } = monthResult;
+
+    // Year-to-date: always the real current calendar year through today,
+    // independent of whichever month is being browsed (navigating to a past
+    // or future month via the Cash Flow page's month picker must not change
+    // what "this year so far" means).
+    const today = todayISOInTimezone();
+    const ytdYear = today.slice(0, 4);
+    const ytdStart = `${ytdYear}-01-01`;
+    const ytdResult = classifySettled(ytdStart, today);
+
+    // Tenant-paid responsibilities (maintenance/electricity/etc. the tenant
+    // pays directly, e.g. from an agreement's responsibility clause) are
+    // informational only -- reused straight from the obligations already
+    // fetched above, never counted in expensesPaid/categoryTotals above
+    // unless an actual owner-paid transaction exists for it. Rent is excluded
+    // here since a tenant-paid rent obligation is income, not a "responsibility".
+    const tenantResponsibilities = (obligations || [])
+      .filter(o => o.paid_by === 'tenant' && o.type !== 'rent')
+      .map(o => ({ label: o.label, type: o.type, property_name: propertyName(o.property_id) }));
 
     // ---- Upcoming / awaiting confirmation: this month + next month only, never further ----
-    const today = todayISOInTimezone();
     const buildUpcoming = (m, per, start, end) => {
-      const monthPayments = (payments || []).filter(p => paymentInMonth(p, per, start, end));
+      const monthPayments = (payments || []).filter(p => paymentInRange(p, start, end));
       return (obligations || []).map(o => {
         const dueDate = dueDateForExplicitMonth(m, o.due_day);
         const { status, payment } = reminders.computeDueStatus({ obligationId: o.id, payments: monthPayments, dueDate, today });
@@ -1461,8 +1537,10 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
 
     res.json({
       month, nextMonth, propertyId,
-      cashReceived, expensesPaid, netCashFlow: cashReceived - expensesPaid,
+      cashReceived, expensesPaid, netCashFlow, categoryTotals,
       transactions: transactions.slice(0, 10),
+      ytd: { year: ytdYear, from: ytdStart, through: today, cashReceived: ytdResult.cashReceived, expensesPaid: ytdResult.expensesPaid, netCashFlow: ytdResult.netCashFlow, categoryTotals: ytdResult.categoryTotals },
+      tenantResponsibilities,
       upcoming, openMaintenance, deposits
     });
   } catch (err) {
@@ -1708,13 +1786,28 @@ app.post('/api/properties/:propertyId/appliances', verifyToken, async (req, res)
   try {
     const b = req.body;
     if (!b.name) return res.status(400).json({ error: 'Name required (e.g. Geyser - bathroom)' });
+    const source = b.source === 'agreement' ? 'agreement' : 'manual';
+    // Idempotency guard, opt-in only: an agreement can be approved more than
+    // once (e.g. a retried/duplicate submit) without creating a second row
+    // for the same fixture. Scoped to source='agreement' specifically -- a
+    // manual add (AssetsPage) never sends this flag, so two legitimately
+    // separate appliances that happen to share a plain name (e.g. two rooms
+    // each with a "Fan") are never silently merged.
+    if (source === 'agreement') {
+      const { data: existing } = await supabase.from('appliances').select('*')
+        .eq('property_id', req.params.propertyId).eq('user_id', req.userId)
+        .eq('source', 'agreement').ilike('name', b.name.trim());
+      if (existing && existing.length > 0) return res.status(200).json(existing[0]);
+    }
     const row = addWarrantyEnd({
       property_id: req.params.propertyId, user_id: req.userId,
       name: b.name.trim(), category: b.category || 'other', brand: b.brand || null,
       model: b.model || null, serial_number: b.serial_number || null,
       purchase_date: b.purchase_date || null, warranty_end: b.warranty_end || null,
       warranty_months: b.warranty_months || null, amc_provider: b.amc_provider || null,
-      service_phone: b.service_phone || null, bill_url: b.bill_url || null, notes: b.notes || null
+      service_phone: b.service_phone || null, bill_url: b.bill_url || null, notes: b.notes || null,
+      quantity: (Number.isInteger(b.quantity) || /^\d+$/.test(b.quantity || '')) && parseInt(b.quantity, 10) > 0 ? parseInt(b.quantity, 10) : 1,
+      source
     });
     const { data, error } = await supabase.from('appliances').insert([row]).select();
     if (error) throw error;
@@ -1739,8 +1832,13 @@ app.patch('/api/appliances/:id', verifyToken, requireOwner, async (req, res) => 
       return badRequest(res, 'Invalid condition_status');
     }
     const allowed = {};
-    for (const k of ['name', 'category', 'brand', 'model', 'serial_number', 'purchase_date', 'warranty_end', 'amc_provider', 'service_phone', 'notes', 'condition_status']) {
+    for (const k of ['name', 'category', 'brand', 'model', 'serial_number', 'purchase_date', 'warranty_end', 'amc_provider', 'service_phone', 'notes', 'condition_status', 'quantity']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
+    }
+    if (allowed.quantity !== undefined) {
+      const q = parseInt(allowed.quantity, 10);
+      if (!(q > 0)) return badRequest(res, 'quantity must be a positive integer');
+      allowed.quantity = q;
     }
     const { data, error } = await supabase.from('appliances').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;

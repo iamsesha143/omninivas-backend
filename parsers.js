@@ -190,6 +190,23 @@ const parseTenantsFromText = (text) => {
     aadhars.push(aadhar || null);
   };
 
+  // 0) The standard Indian rental-agreement party clause: "<Name> (hereinafter
+  // called the "LESSEE/TENANT" ...)". Found to be the single most common real
+  // document structure (missed entirely before this pattern existed -- 0
+  // tenants extracted on a realistic sample agreement using this exact
+  // phrasing). The "hereinafter ... lessee/tenant" keyword match stays
+  // case-insensitive (documents often render it "LESSEE/TENANT" in caps), but
+  // the immediately-preceding name is validated separately with a
+  // case-SENSITIVE title-case check (a mixed-case regex under the same /i
+  // flag would also match ALL-CAPS boilerplate like "ONE PART" or "AND",
+  // since /i makes [a-z] match uppercase too) -- this two-step split is what
+  // keeps the Lessor's own name (tagged "LESSOR/OWNER" in the mirror clause
+  // just above) from ever being captured here.
+  for (const hm of text.matchAll(/\(hereinafter\s+(?:called|referred\s+to\s+as)[^)]{0,80}(lessee|tenant)[^)]*\)/gi)) {
+    const before = text.slice(Math.max(0, hm.index - 80), hm.index);
+    const nameMatch = before.match(/((?:[A-Z][a-z]+\.?\s+){0,4}[A-Z][a-z]+\.?)\s*$/);
+    if (nameMatch) addName(nameMatch[1]);
+  }
   // 1) Names directly above an "Aadhar id" line (most reliable; tolerate OCR typos like "Aadbhar").
   // [A-Z .] (no \n) keeps the match on a single line so it can't swallow preceding lines.
   for (const m of text.matchAll(/(?:^|\n)[^\w\n]*([A-Z][A-Z .]{3,45})[ \t]*\n[^\n]*?a[a-z]{1,3}h?[a-z]?r\s*id\s*[-—:\s]*(\d{12})/gi)) {
@@ -219,6 +236,116 @@ const parseTenantsFromText = (text) => {
   }
   // A tenant found via a structured pattern (real name) is valid even without contact info
   return tenants.filter(t => !t.name.startsWith('Tenant ') || t.personal_email || t.personal_phone);
+};
+
+// Deterministic (non-AI) extraction of the clause-level facts an owner needs
+// to review after uploading a signed agreement: rent amount/due day, deposit
+// amount + refundable status, who's responsible for maintenance/electricity,
+// and fixtures/fittings with quantities. Mirrors parsePropertyFromText's own
+// regex-only approach -- these facts must extract reliably even when the AI
+// gateway is unavailable (llm.js's extractAgreementFacts is entirely
+// gateway-dependent and has been confirmed dormant since 2026-08-03; this
+// function has no such dependency). Each found fact also carries the exact
+// source snippet it was read from, in `evidence`, for the review screen to
+// show provenance -- never returned as final truth, only as something to
+// verify/edit/reject.
+const FIXTURE_DEFS = [
+  { name: 'Modular Kitchen', re: /modular\s*kitchen/i },
+  { name: 'Chimney', re: /chimney/i },
+  { name: 'Geyser', re: /geysers?/i },
+  { name: 'Fan', re: /\bfans?\b/i },
+  { name: 'Tube Light', re: /tube\s*lights?/i },
+  { name: 'Wardrobe', re: /wardrobes?/i },
+  { name: 'Air Conditioner', re: /\bA\/?Cs?\b|air[\s-]?condition(?:er)?s?/i },
+  { name: 'Refrigerator', re: /refrigerator|fridge/i },
+  { name: 'Washing Machine', re: /washing\s*machine/i },
+  { name: 'Bed', re: /\bbeds?\b/i }
+];
+
+// A quantity phrased either before ("3 Fans") or after ("Fans - 3 Nos.") the
+// item name. No explicit count found near the mention -> singular (1), which
+// is also correct for an item listed on its own (e.g. "Geyser - 1 No.").
+function extractQuantityNear(text, matchIndex, matchLength) {
+  const before = text.slice(Math.max(0, matchIndex - 15), matchIndex);
+  const after = text.slice(matchIndex + matchLength, matchIndex + matchLength + 20);
+  const beforeNum = before.match(/(\d{1,2})\s*(?:x\s*)?$/);
+  if (beforeNum) return parseInt(beforeNum[1], 10);
+  const afterNum = after.match(/^\s*[-:]?\s*(\d{1,2})\s*(?:no\.?s?|nos\.?|units?|pieces?|pcs?)?\b/i);
+  if (afterNum) return parseInt(afterNum[1], 10);
+  return 1;
+}
+
+const parseAgreementFactsFromText = (rawText) => {
+  const text = normalizeText(rawText || '');
+  const out = {
+    rent_amount: null, rent_due_day: null,
+    deposit_total: null, deposit_refundable: null,
+    maintenance_payer: null, electricity_payer: null,
+    fixtures: [], evidence: {}
+  };
+
+  // Rent amount: prefer a currency figure near the word "rent"; fall back to
+  // a currency figure near "per month"/"monthly rent" phrasing.
+  let rentMatch = text.match(/rent[\s\S]{0,60}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i);
+  if (!rentMatch) rentMatch = text.match(/(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?[\s\S]{0,40}?(?:per\s*month|monthly\s*rent|as\s*rent)/i);
+  if (rentMatch) {
+    const v = parseInt(rentMatch[1].replace(/,/g, ''), 10);
+    if (v >= 500 && v <= 1000000) { out.rent_amount = v; out.evidence.rent_amount = cleanSpaces(rentMatch[0]); }
+  }
+
+  // Rent due day: "on or before the 5th day of every ... month" style clauses,
+  // falling back to a bare "Nth day of every month" or "rent due day: N".
+  const dueDayMatch = text.match(/(?:on or before|due on|payable on|by)\s+the\s+(\d{1,2})(?:st|nd|rd|th)?\s+(?:day\s+)?of\s+(?:every|each)\s+(?:[a-z]+\s+){0,2}month/i)
+    || text.match(/(\d{1,2})(?:st|nd|rd|th)?\s+(?:day\s+)?of\s+(?:every|each)\s+(?:[a-z]+\s+){0,2}month/i)
+    || text.match(/rent\s+due\s+(?:date|day)?\s*[:\-]?\s*(\d{1,2})(?:st|nd|rd|th)?/i);
+  if (dueDayMatch) {
+    const day = parseInt(dueDayMatch[1], 10);
+    if (day >= 1 && day <= 31) { out.rent_due_day = day; out.evidence.rent_due_day = cleanSpaces(dueDayMatch[0]); }
+  }
+
+  // Deposit total + refundable status, the latter read from the sentence the
+  // amount itself was found in (never inferred from elsewhere in the document).
+  const depositMatch = text.match(/security\s+deposit[\s\S]{0,80}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i)
+    || text.match(/deposit[\s\S]{0,80}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i);
+  if (depositMatch) {
+    const v = parseInt(depositMatch[1].replace(/,/g, ''), 10);
+    if (v >= 500 && v <= 100000000) {
+      out.deposit_total = v;
+      out.evidence.deposit_total = cleanSpaces(depositMatch[0]);
+      const clauseWindow = text.slice(depositMatch.index, Math.min(text.length, depositMatch.index + depositMatch[0].length + 150));
+      out.deposit_refundable = /non[\s-]?refundable/i.test(clauseWindow) ? false : (/refundable/i.test(clauseWindow) ? true : null);
+    }
+  }
+
+  // Maintenance/electricity responsibility: "<keyword> ... shall be borne/paid
+  // by the tenant/lessee/owner/lessor". tenant and lessee both normalize to
+  // 'tenant'; owner and lessor (and landlord) both normalize to 'owner'.
+  const findPayer = (keywordRe) => {
+    const re = new RegExp(`${keywordRe.source}[\\s\\S]{0,150}?(?:shall\\s+be\\s+(?:borne(?:\\s+and\\s+paid)?|paid)|to\\s+be\\s+(?:borne|paid)|payable|borne)\\s+by\\s+(?:the\\s+)?(tenant|lessee|owner|lessor|landlord)`, 'i');
+    const mm = text.match(re);
+    if (!mm) return null;
+    const who = mm[1].toLowerCase();
+    return { payer: (who === 'tenant' || who === 'lessee') ? 'tenant' : 'owner', evidence: cleanSpaces(mm[0]) };
+  };
+  const maint = findPayer(/maintenance/i);
+  if (maint) { out.maintenance_payer = maint.payer; out.evidence.maintenance_payer = maint.evidence; }
+  const elec = findPayer(/electricity/i);
+  if (elec) { out.electricity_payer = elec.payer; out.evidence.electricity_payer = elec.evidence; }
+
+  // Fixtures: each known item name found gets its nearby quantity. "Tube
+  // Light" is checked before the generic "Light" fallback so "tube lights"
+  // isn't double-counted as both a distinct tube-light item and a plain light.
+  for (const def of FIXTURE_DEFS) {
+    const fm = text.match(def.re);
+    if (!fm) continue;
+    out.fixtures.push({ name: def.name, quantity: extractQuantityNear(text, fm.index, fm[0].length) });
+  }
+  if (!out.fixtures.some(f => f.name === 'Tube Light')) {
+    const fm = text.match(/\blights?\b/i);
+    if (fm) out.fixtures.push({ name: 'Light', quantity: extractQuantityNear(text, fm.index, fm[0].length) });
+  }
+
+  return out;
 };
 
 // Pulls amount, date, and UTR/reference out of OCR'd payment screenshots (GPay/PhonePe/bank).
@@ -280,4 +407,4 @@ const parseApplianceFromText = (text) => {
   return out;
 };
 
-module.exports = { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText };
+module.exports = { parsePropertyFromText, parseTenantsFromText, parsePaymentProof, parseApplianceFromText, parseAgreementFactsFromText };

@@ -212,6 +212,108 @@ test('cashflow: deposit status derivation covers awaiting/received/partially_ref
   assert.equal(byName['Full refund'], 'refunded');
 });
 
+test('cashflow: categoryTotals groups owner-paid expenses by obligation label and by "Maintenance", excluding income', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('obligations', {
+    data: [
+      { id: 'ob-elec', property_id: 'prop-1', paid_by: 'owner', label: 'Electricity', type: 'electricity', amount: 1500, due_day: 5 },
+      { id: 'ob-rent', property_id: 'prop-1', paid_by: 'tenant', label: 'Rent', type: 'rent', amount: 15000, due_day: 5 }
+    ], error: null
+  });
+  mockDb.__queue('payments', {
+    data: [
+      { id: 'p-1', property_id: 'prop-1', amount: 1500, payment_date: '2026-08-05', period: '2026-08-01', status: 'paid', tenant_id: null, obligation_id: 'ob-elec' },
+      { id: 'p-2', property_id: 'prop-1', amount: 15000, payment_date: '2026-08-05', period: '2026-08-01', status: 'paid', tenant_id: 't-1', obligation_id: 'ob-rent' }
+    ], error: null
+  });
+  mockDb.__queue('maintenance_costs', { data: [{ id: 'm-1', property_id: 'prop-1', amount: 800, cost_date: '2026-08-10', status: 'paid', paid_by: 'owner', description: 'Plumber', request_status: 'resolved' }], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+
+  const res = await api('/api/cashflow?month=2026-08', ownerToken);
+  const byLabel = Object.fromEntries(res.body.categoryTotals.map(c => [c.label, c.amount]));
+  assert.equal(byLabel['Electricity'], 1500);
+  assert.equal(byLabel['Maintenance'], 800);
+  assert.equal(byLabel['Rent'], undefined, 'tenant-paid rent (income) must never appear in owner-cost category totals');
+});
+
+test('cashflow: tenantResponsibilities lists tenant-paid non-rent obligations, informational only -- never counted in expensesPaid', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('obligations', {
+    data: [
+      { id: 'ob-elec', property_id: 'prop-1', paid_by: 'tenant', label: 'Electricity', type: 'electricity', amount: null, due_day: 5 },
+      { id: 'ob-maint', property_id: 'prop-1', paid_by: 'tenant', label: 'Society Maintenance', type: 'society_maintenance', amount: null, due_day: 5 },
+      { id: 'ob-rent', property_id: 'prop-1', paid_by: 'tenant', label: 'Rent', type: 'rent', amount: 15000, due_day: 5 }
+    ], error: null
+  });
+  mockDb.__queue('payments', { data: [], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+
+  const res = await api('/api/cashflow?month=2026-08', ownerToken);
+  const labels = res.body.tenantResponsibilities.map(r => r.label);
+  assert.ok(labels.includes('Electricity'));
+  assert.ok(labels.includes('Society Maintenance'));
+  assert.ok(!labels.includes('Rent'), 'tenant-paid rent is income, not a "responsibility"');
+  assert.equal(res.body.expensesPaid, 0, 'an unpaid tenant responsibility with no owner transaction must not appear as an owner cost');
+});
+
+test('cashflow: deposits are never included in cashReceived, expensesPaid, or netCashFlow', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('tenants', { data: [{ id: 't-1', property_id: 'prop-1', name: 'Asha', deposit_amount: 150000, deposit_paid_date: '2026-08-01', deposit_details: 'Online transfer', deposit_refunded_amount: null, deposit_refunded_date: null }], error: null });
+
+  const res = await api('/api/cashflow?month=2026-08', ownerToken);
+  assert.equal(res.body.cashReceived, 0);
+  assert.equal(res.body.expensesPaid, 0);
+  assert.equal(res.body.netCashFlow, 0);
+  assert.equal(res.body.deposits[0].agreed_amount, 150000, 'the deposit itself is still visible, just kept out of operating cash totals');
+});
+
+test('cashflow: year-to-date total includes a settled transaction from earlier in the current year but outside the browsed month', async () => {
+  const thisYear = new Date().getFullYear();
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [{ id: 'p-1', property_id: 'prop-1', amount: 15000, payment_date: `${thisYear}-01-15`, period: `${thisYear}-01-01`, status: 'paid', tenant_id: 't-1', obligation_id: null }], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+
+  const res = await api('/api/cashflow?month=2026-08', ownerToken);
+  assert.equal(res.body.cashReceived, 0, 'January income must not appear in the August month view');
+  assert.equal(res.body.ytd.year, String(thisYear));
+  assert.ok(res.body.ytd.cashReceived >= 15000, 'January income must be included in year-to-date');
+});
+
+test('cashflow: year-to-date excludes a settled transaction from the previous calendar year', async () => {
+  const priorYear = new Date().getFullYear() - 1;
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [{ id: 'p-1', property_id: 'prop-1', amount: 99999, payment_date: `${priorYear}-12-31`, period: `${priorYear}-12-01`, status: 'paid', tenant_id: 't-1', obligation_id: null }], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+
+  const res = await api('/api/cashflow?month=2026-08', ownerToken);
+  assert.equal(res.body.ytd.cashReceived, 0, 'a payment from the previous calendar year must never leak into this year\'s YTD');
+});
+
+test('cashflow: an all-empty period returns honest zeroed totals and empty arrays, not fabricated data', async () => {
+  mockDb.__queue('properties', { data: [{ id: 'prop-1', property_name: 'P' }], error: null });
+  mockDb.__queue('obligations', { data: [], error: null });
+  mockDb.__queue('payments', { data: [], error: null });
+  mockDb.__queue('maintenance_costs', { data: [], error: null });
+  mockDb.__queue('tenants', { data: [], error: null });
+
+  const res = await api('/api/cashflow?month=2026-08', ownerToken);
+  assert.equal(res.body.cashReceived, 0);
+  assert.equal(res.body.expensesPaid, 0);
+  assert.deepEqual(res.body.categoryTotals, []);
+  assert.deepEqual(res.body.transactions, []);
+  assert.deepEqual(res.body.tenantResponsibilities, []);
+  assert.equal(res.body.ytd.cashReceived, 0);
+  assert.deepEqual(res.body.ytd.categoryTotals, []);
+});
+
 // ---- GET /api/approvals ----
 
 test('approvals: pending_confirmation payment appears with tenant name and label', async () => {
