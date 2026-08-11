@@ -1640,7 +1640,7 @@ app.get('/api/approvals', verifyToken, async (req, res) => {
     let messageTsByKey = {};
     if (relevantImportIds.length > 0) {
       const { data: facts, error: e6 } = await supabase.from('whatsapp_extracted_facts')
-        .select('id, import_id, category, fact_type, value, confidence, evidence, status, owner_edited_value, applied_at, message_seq')
+        .select('id, import_id, category, fact_type, value, confidence, evidence, status, owner_edited_value, applied_at, message_seq, owner_corrected_category, owner_corrected_fact_type, property_id, participant_role, participant_ref')
         .in('import_id', relevantImportIds)
         .in('category', ['payment', 'deposit', 'maintenance', 'utility_cost']);
       if (e6) throw e6;
@@ -1678,8 +1678,14 @@ app.get('/api/approvals', verifyToken, async (req, res) => {
       // actions against their real endpoints. Reusing it here, not
       // reimplementing its logic.
       ...whatsappFacts.map(f => ({
-        type: 'whatsapp_fact', id: f.id, property_name: propertyName(importPropertyById.get(f.import_id)),
+        type: 'whatsapp_fact', id: f.id, property_name: propertyName(f.property_id || importPropertyById.get(f.import_id)),
         category: f.category, fact_type: f.fact_type, value: f.value, owner_edited_value: f.owner_edited_value,
+        // Owner-correction fields, passed straight through so FactCard can
+        // show both what was originally extracted and what will actually be
+        // used on approval (effective_category/effective_fact_type below).
+        owner_corrected_category: f.owner_corrected_category, owner_corrected_fact_type: f.owner_corrected_fact_type,
+        effective_category: f.owner_corrected_category || f.category, effective_fact_type: f.owner_corrected_fact_type || f.fact_type,
+        property_id: f.property_id || null, participant_role: f.participant_role || 'unknown', participant_ref: f.participant_ref || null,
         confidence: f.confidence, evidence: f.evidence, status: f.status, applied_at: f.applied_at || null,
         // null when the source message row can't be found (e.g. deleted) --
         // the card omits the date line entirely rather than showing a gap.
@@ -2483,7 +2489,10 @@ function extractChatTextFromZip(buffer) {
   const chatEntry = entries.find(e => /chat/i.test(e.entryName)) || entries[0];
   return chatEntry.getData().toString('utf8');
 }
-const { extractWhatsAppFacts } = require('./llm');
+const { extractWhatsAppFacts, WHATSAPP_CATEGORIES, WHATSAPP_FACT_TYPES } = require('./llm');
+const {
+  PARTICIPANT_ROLES, withEffectiveFields, applyDepositFirstSafetyNet, applyRepairOffsetSafetyNet
+} = require('./whatsappFactResolution');
 
 // Defense-in-depth alongside the extraction prompt's own instruction: mask any
 // 10+ digit run (Aadhaar/PAN-length numbers) before a fact ever reaches the DB,
@@ -2550,11 +2559,18 @@ app.post('/api/whatsapp/import', verifyToken, upload.single('file'), async (req,
     let finalStatus = 'extraction_unavailable';
     let duplicateCount = 0;
     if (!extraction.skipped) {
-      let candidateFacts = extraction.facts.map(f => ({
-        import_id: importRow.id, category: f.category, fact_type: f.fact_type || null,
-        value: redactLongDigitRuns(String(f.value)), confidence: typeof f.confidence === 'number' ? f.confidence : null,
-        evidence: redactLongDigitRuns(f.evidence || ''), message_seq: typeof f.message_seq === 'number' ? f.message_seq : null
-      }));
+      let candidateFacts = extraction.facts.map(f => {
+        const row = {
+          import_id: importRow.id, category: f.category, fact_type: f.fact_type || null,
+          value: redactLongDigitRuns(String(f.value)), confidence: typeof f.confidence === 'number' ? f.confidence : null,
+          evidence: redactLongDigitRuns(f.evidence || ''), message_seq: typeof f.message_seq === 'number' ? f.message_seq : null
+        };
+        // Deterministic safety net (server.js, not AI): never changes
+        // category/fact_type above, only pre-fills owner_corrected_* on the
+        // same insert when applicable -- see applyDepositFirstSafetyNet/
+        // applyRepairOffsetSafetyNet for why.
+        return applyRepairOffsetSafetyNet(applyDepositFirstSafetyNet(row));
+      });
 
       // Merge into the same property's history instead of creating duplicate
       // parallel facts: when this import is attached to a property, skip any
@@ -2652,17 +2668,52 @@ app.patch('/api/whatsapp/imports/:id', verifyToken, async (req, res) => {
 // approved fact into core records is intentionally deferred to a later phase.
 app.patch('/api/whatsapp/facts/:id', verifyToken, async (req, res) => {
   try {
-    const { status, owner_edited_value } = req.body;
+    const { status, owner_edited_value, owner_corrected_category, owner_corrected_fact_type, property_id, participant_role } = req.body;
     if (status && !['pending', 'approved', 'edited', 'rejected'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
-    const { data: existing } = await supabase.from('whatsapp_extracted_facts').select('id, whatsapp_imports!inner(user_id)')
+    // Bounded lists only -- never arbitrary free text. null is allowed for
+    // owner_corrected_category/fact_type to explicitly clear a prior
+    // correction back to "use the original extraction".
+    if (owner_corrected_category !== undefined && owner_corrected_category !== null && !WHATSAPP_CATEGORIES.includes(owner_corrected_category)) {
+      return res.status(400).json({ error: 'owner_corrected_category must be one of ' + WHATSAPP_CATEGORIES.join(', ') });
+    }
+    if (owner_corrected_fact_type !== undefined && owner_corrected_fact_type !== null && !WHATSAPP_FACT_TYPES.includes(owner_corrected_fact_type)) {
+      return res.status(400).json({ error: 'owner_corrected_fact_type must be one of ' + WHATSAPP_FACT_TYPES.join(', ') });
+    }
+    if (participant_role !== undefined && !PARTICIPANT_ROLES.includes(participant_role)) {
+      return res.status(400).json({ error: 'participant_role must be one of ' + PARTICIPANT_ROLES.join(', ') });
+    }
+    const { data: existing } = await supabase.from('whatsapp_extracted_facts').select('id, applied_at, whatsapp_imports!inner(user_id)')
       .eq('id', req.params.id).eq('whatsapp_imports.user_id', req.userId).maybeSingle();
     if (!existing) return res.status(404).json({ error: 'Fact not found' });
+
+    // Corrections are for pending/unapplied facts only -- once a fact has
+    // actually been applied into a real record, changing what it "would
+    // have meant" retroactively has no safe, audited path in this slice.
+    // status/owner_edited_value are unaffected (unchanged pre-existing
+    // behavior); only the four new correction fields are gated here.
+    const correctingFields = [owner_corrected_category, owner_corrected_fact_type, property_id, participant_role].some(v => v !== undefined);
+    if (existing.applied_at && correctingFields) {
+      return res.status(400).json({ error: 'This fact has already been applied -- corrections are only allowed before applying.' });
+    }
+
+    if (property_id !== undefined && property_id !== null) {
+      const { data: prop } = await supabase.from('properties').select('id').eq('id', property_id).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+      if (!prop) return res.status(400).json({ error: 'property_id must be one of your own properties' });
+    }
+
     const allowed = {};
     if (status !== undefined) allowed.status = status;
     if (owner_edited_value !== undefined) allowed.owner_edited_value = owner_edited_value;
+    if (owner_corrected_category !== undefined) allowed.owner_corrected_category = owner_corrected_category;
+    if (owner_corrected_fact_type !== undefined) allowed.owner_corrected_fact_type = owner_corrected_fact_type;
+    if (property_id !== undefined) allowed.property_id = property_id;
+    if (participant_role !== undefined) allowed.participant_role = participant_role;
     const { data, error } = await supabase.from('whatsapp_extracted_facts').update(allowed).eq('id', req.params.id).select();
     if (error) throw error;
-    res.json(data[0]);
+    // effective_category/effective_fact_type make "what will actually be
+    // used on approval" unambiguous for the frontend, without it needing to
+    // reimplement the fallback-to-original logic itself.
+    res.json(withEffectiveFields(data[0]));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2675,7 +2726,12 @@ app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) =
     const { data: fact } = await supabase.from('whatsapp_extracted_facts').select('*, whatsapp_imports!inner(user_id, property_id)')
       .eq('id', req.params.id).eq('whatsapp_imports.user_id', req.userId).maybeSingle();
     if (!fact) return res.status(404).json({ error: 'Fact not found' });
-    const propertyId = fact.whatsapp_imports.property_id;
+    // Effective property: fact-level override when present, else the
+    // import-level fallback (unchanged behavior for every fact that has
+    // never had a per-fact property set). Ownership is re-checked below via
+    // the same .eq('user_id', req.userId) regardless of which one it came
+    // from, so a corrected property can never leak another owner's data.
+    const propertyId = fact.property_id || fact.whatsapp_imports.property_id;
     let property = null, tenants = [], obligations = [];
     if (propertyId) {
       const [{ data: p }, { data: t }, { data: o }] = await Promise.all([
@@ -2693,7 +2749,7 @@ app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) =
       property = p; tenants = t || []; obligations = o || [];
     }
     delete fact.whatsapp_imports;
-    res.json({ fact, property, tenants, obligations });
+    res.json({ fact: withEffectiveFields(fact), property, tenants, obligations });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
