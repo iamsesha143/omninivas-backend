@@ -390,7 +390,7 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
 // -- no new per-tenant column. Re-callable any time to correct/replace the split.
 app.patch('/api/properties/:id/deposit', verifyToken, async (req, res) => {
   try {
-    const { deposit_total, accept_suggestion } = req.body;
+    const { deposit_total, accept_suggestion, tenant_ids, source: requestedSource } = req.body;
     const { data: prop } = await supabase.from('properties').select('id,deposit_suggested_total').eq('id', req.params.id).eq('user_id', req.userId).is('deleted_at', null).single();
     if (!prop) return res.status(404).json({ error: 'Property not found' });
     let total, source;
@@ -402,17 +402,69 @@ app.patch('/api/properties/:id/deposit', verifyToken, async (req, res) => {
       if (!total || total <= 0) return res.status(400).json({ error: 'A positive deposit_total is required' });
       source = 'manual';
     }
+    // An explicit source in the body overrides the derived default above --
+    // needed for the deterministic (non-AI) agreement-attach flow, which must
+    // never be recorded under the legacy AI-only 'agreement_ai' label.
+    if (requestedSource !== undefined) {
+      if (!['manual', 'agreement', 'agreement_ai'].includes(requestedSource)) {
+        return res.status(400).json({ error: 'source must be manual, agreement, or agreement_ai' });
+      }
+      source = requestedSource;
+    }
+
+    // Scoped assignment: only when the caller resolves specific tenant IDs
+    // (e.g. the agreement-attach flow, which knows exactly which tenant(s)
+    // this declaration is for). Validated against this property+owner before
+    // any write happens -- a foreign/invalid ID rejects the whole request.
+    let scopedTenants = null;
+    if (tenant_ids !== undefined) {
+      if (!Array.isArray(tenant_ids) || tenant_ids.length === 0) {
+        return res.status(400).json({ error: 'tenant_ids must be a non-empty array' });
+      }
+      const { data: owned, error: tErr } = await supabase.from('tenants').select('id, deposit_paid_date')
+        .eq('property_id', req.params.id).eq('user_id', req.userId).in('id', tenant_ids);
+      if (tErr) throw tErr;
+      const ownedIds = new Set((owned || []).map(t => t.id));
+      const missing = tenant_ids.filter(id => !ownedIds.has(id));
+      if (missing.length > 0) {
+        return res.status(400).json({ error: `tenant_ids includes IDs that don't belong to this property: ${missing.join(', ')}` });
+      }
+      scopedTenants = owned;
+    }
+
     const { data: updated, error } = await supabase.from('properties')
       .update({ deposit_total: total, deposit_source: source, deposit_confirmed_at: new Date().toISOString() })
       .eq('id', req.params.id).select().single();
     if (error) throw error;
-    const { data: tenants } = await supabase.from('tenants').select('id').eq('property_id', req.params.id).eq('is_active', true);
-    const tenantCount = tenants?.length || 0;
-    const perTenant = tenantCount > 0 ? Math.round((total / tenantCount) * 100) / 100 : total;
-    if (tenantCount > 0) {
-      await supabase.from('tenants').update({ deposit_amount: perTenant }).eq('property_id', req.params.id).eq('is_active', true);
+
+    let tenantCount, perTenant, assignedCount, skippedConfirmedCount;
+    if (scopedTenants) {
+      // Never overwrite a tenant whose deposit is already confirmed received
+      // -- excluded from the split entirely, not just from being touched.
+      const assignable = scopedTenants.filter(t => !t.deposit_paid_date);
+      skippedConfirmedCount = scopedTenants.length - assignable.length;
+      tenantCount = assignable.length;
+      perTenant = tenantCount > 0 ? Math.round((total / tenantCount) * 100) / 100 : null;
+      assignedCount = tenantCount;
+      if (tenantCount > 0) {
+        const { error: uErr } = await supabase.from('tenants').update({ deposit_amount: perTenant }).in('id', assignable.map(t => t.id));
+        if (uErr) throw uErr;
+      }
+    } else {
+      // Legacy fallback (tenant_ids omitted): unchanged from before this
+      // change -- every active tenant on the property, exactly as older
+      // callers (new-property creation, the plain TenantsPage confirm flow)
+      // already depend on.
+      const { data: tenants } = await supabase.from('tenants').select('id').eq('property_id', req.params.id).eq('is_active', true);
+      tenantCount = tenants?.length || 0;
+      perTenant = tenantCount > 0 ? Math.round((total / tenantCount) * 100) / 100 : total;
+      assignedCount = tenantCount;
+      skippedConfirmedCount = 0;
+      if (tenantCount > 0) {
+        await supabase.from('tenants').update({ deposit_amount: perTenant }).eq('property_id', req.params.id).eq('is_active', true);
+      }
     }
-    res.json({ property: updated, per_tenant: perTenant, tenant_count: tenantCount });
+    res.json({ property: updated, per_tenant: perTenant, tenant_count: tenantCount, assigned_count: assignedCount, skipped_confirmed_count: skippedConfirmedCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
