@@ -122,6 +122,34 @@ function moveOutCompletedEmail({ tenantName, propertyName }) {
   return { subject, html, text };
 }
 
+// Password reset: unlike the opt-out preference gating every other template
+// in this file goes through (getEmailPreference/getTenantEmailPreference),
+// this is a security-critical transactional email that must always attempt
+// to send regardless of the user's notification preferences -- account
+// recovery isn't an "update" a user should be able to silently miss.
+function passwordResetEmailContent({ userName, resetUrl, minutes }) {
+  const subject = 'Reset your OMniNivas password';
+  const n = escapeHtml(userName);
+  const html = wrap(`
+    <p>Hi ${n},</p>
+    <p>We received a request to reset your OMniNivas password. Click the link below to choose a new one -- it expires in <b>${minutes} minutes</b> and can only be used once.</p>
+    <p><a href="${resetUrl}">${resetUrl}</a></p>
+    <p>If you didn't request this, you can safely ignore this email -- your password will not be changed.</p>
+  `);
+  const text = `Hi ${userName}, we received a request to reset your OMniNivas password. Use this link within ${minutes} minutes (one-time use): ${resetUrl}\n\nIf you didn't request this, you can safely ignore this email -- your password will not be changed.`;
+  return { subject, html, text };
+}
+
+// Combined template+send, per the approved design -- unlike the other
+// template functions above (which return {subject,html,text} for the
+// caller to pass into sendEmail separately), this one sends directly since
+// every caller needs exactly the same "build the reset link, send it" step
+// with no branching in between.
+async function sendPasswordResetEmail(user, resetUrl, minutes = 30) {
+  const body = passwordResetEmailContent({ userName: user.full_name || 'there', resetUrl, minutes });
+  return sendEmail({ to: user.email, ...body });
+}
+
 // Scaffolding only (task: "optional... even if not fully wired") — no cron/scheduler
 // infra exists in this codebase yet, so nothing calls this today. Wire it up once
 // a scheduled job mechanism exists (see the TODO near the obligations/dues logic
@@ -146,5 +174,8 @@ module.exports = {
   handoverCreatedEmail,
   handoverCompletedEmail,
   moveOutCompletedEmail,
-  rentDueReminderEmail
+  rentDueReminderEmail,
+  passwordResetEmailContent,
+  sendPasswordResetEmail,
+  APP_URL
 };

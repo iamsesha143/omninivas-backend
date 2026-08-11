@@ -19,6 +19,7 @@ const mw = require('./maintenanceWorkflow');
 const uploadValidation = require('./uploadValidation');
 const reminders = require('./reminders');
 const { todayISOInTimezone, dueDateForExplicitMonth, daysInMonth } = require('./dateUtils');
+const notifications = require('./notifications');
 
 const app = express();
 
@@ -223,6 +224,88 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     res.json({ user: data, token, role });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ===== PASSWORD RESET (self-service account recovery) =====
+
+const RESET_TOKEN_TTL_MINUTES = 30;
+// SHA-256, not bcrypt: the raw token already carries 256 bits of entropy
+// (crypto.randomBytes(32)), so the property this hash needs is "can't be
+// reversed from a DB dump", not "resists offline brute force" -- the latter
+// is what a slow hash like bcrypt is for, and doesn't apply to a token this
+// large. Matches the standard pattern used by Django/Rails/most frameworks.
+const hashResetToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
+const FORGOT_PASSWORD_GENERIC_RESPONSE = { message: "If an account exists for this email, we've sent a reset link." };
+
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  // This route NEVER returns anything other than the one generic message,
+  // on any path (found, not found, or an internal error) -- account
+  // enumeration protection extends to error behavior too, not just the
+  // happy path. Every failure is logged server-side only.
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (email) {
+      const { data: user } = await supabase.from('users').select('id, email, full_name').eq('email', email).maybeSingle();
+      // Token generation always runs, whether or not a user was found, to
+      // narrow (not eliminate -- DB/email I/O still varies) the timing gap
+      // between the "exists" and "doesn't exist" paths.
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = hashResetToken(rawToken);
+      const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MINUTES * 60 * 1000).toISOString();
+      if (user) {
+        await supabase.from('users').update({
+          // Overwriting these three columns is what invalidates any prior
+          // outstanding token for this user -- its hash no longer matches.
+          password_reset_token_hash: tokenHash, password_reset_expires_at: expiresAt, password_reset_used_at: null
+        }).eq('id', user.id);
+        const resetUrl = `${notifications.APP_URL}/reset-password?token=${rawToken}`;
+        // Fire-and-forget, matching this codebase's existing email pattern --
+        // a slow/failed send must never affect this endpoint's generic
+        // response or its timing in a way that's observable to the caller.
+        notifications.sendPasswordResetEmail(user, resetUrl, RESET_TOKEN_TTL_MINUTES).catch(() => {});
+      }
+    }
+    res.json(FORGOT_PASSWORD_GENERIC_RESPONSE);
+  } catch (err) {
+    console.error('[POST /api/auth/forgot-password]', err);
+    res.json(FORGOT_PASSWORD_GENERIC_RESPONSE);
+  }
+});
+
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  try {
+    const { token, new_password } = req.body;
+    if (!token || typeof token !== 'string') return res.status(400).json({ error: 'Reset token is required', reason: 'invalid' });
+    if (!new_password || new_password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const tokenHash = hashResetToken(token);
+    const { data: user } = await supabase.from('users').select('id, password_reset_expires_at, password_reset_used_at')
+      .eq('password_reset_token_hash', tokenHash).maybeSingle();
+    // Distinguishing invalid/used/expired here is safe -- none of these
+    // reveal WHICH email the token belonged to, only the token's own state,
+    // and the frontend needs to show different copy for each.
+    if (!user) return res.status(400).json({ error: 'This reset link is invalid.', reason: 'invalid' });
+    if (user.password_reset_used_at) return res.status(400).json({ error: 'This reset link has already been used.', reason: 'used' });
+    if (!user.password_reset_expires_at || new Date(user.password_reset_expires_at).getTime() <= Date.now()) {
+      return res.status(400).json({ error: 'This reset link has expired. Request a new one.', reason: 'expired' });
+    }
+    const password_hash = await bcrypt.hash(new_password, 10);
+    await supabase.from('users').update({
+      password_hash,
+      // Belt-and-suspenders: clearing the hash makes the raw token
+      // permanently unresolvable even if the used_at check were ever
+      // bypassed by a future bug, on top of used_at itself.
+      password_reset_token_hash: null, password_reset_expires_at: null, password_reset_used_at: new Date().toISOString()
+    }).eq('id', user.id);
+    // Existing JWTs are intentionally left valid -- this codebase has no
+    // session/revocation table (stateless 30-day JWTs), so there is no safe
+    // "invalidate every prior token" mechanism to call here. Disclosed
+    // limitation, not an oversight: a device that was already logged in
+    // before the reset stays logged in until its JWT naturally expires.
+    res.json({ message: 'Password updated. Please log in with your new password.' });
+  } catch (err) {
+    console.error('[POST /api/auth/reset-password]', err);
+    res.status(500).json({ error: 'Unable to reset password right now.' });
   }
 });
 
@@ -1936,8 +2019,6 @@ app.post('/api/properties/:propertyId/appliances/scan', verifyToken, upload.sing
 });
 
 // ===== PHASE 4: APPLIANCE/FIXTURE HANDOVER (move-in + move-out) =====
-
-const notifications = require('./notifications');
 
 // Best-effort email fan-out for handover events — never throws into the route;
 // callers fire-and-forget these (`.catch(() => {})`) so a mail failure can never

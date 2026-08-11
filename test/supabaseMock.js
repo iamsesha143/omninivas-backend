@@ -8,6 +8,7 @@
 function createMockSupabase() {
   const queues = {};
   const inserts = {};
+  const updates = {};
   const storage = { uploaded: [], removed: [], uploadFailAt: null, uploadCallCount: 0 };
 
   function dequeue(table) {
@@ -20,7 +21,7 @@ function createMockSupabase() {
 
   function makeBuilder(table) {
     const builder = {};
-    const chainMethods = ['select', 'eq', 'is', 'ilike', 'order', 'update', 'delete', 'maybeSingle', 'single', 'in', 'neq', 'lte', 'gte', 'not'];
+    const chainMethods = ['select', 'eq', 'is', 'ilike', 'order', 'delete', 'maybeSingle', 'single', 'in', 'neq', 'lte', 'gte', 'not'];
     for (const method of chainMethods) {
       builder[method] = () => builder;
     }
@@ -30,6 +31,13 @@ function createMockSupabase() {
     builder.insert = (payload) => {
       inserts[table] = inserts[table] || [];
       inserts[table].push(payload);
+      return builder;
+    };
+    // Same idea for .update(...) -- lets a test assert on exactly what was
+    // written (e.g. that a stored token is a hash, never the raw value).
+    builder.update = (payload) => {
+      updates[table] = updates[table] || [];
+      updates[table].push(payload);
       return builder;
     };
     // Real supabase-js query builders are thenable -- awaiting the chain at
@@ -74,9 +82,13 @@ function createMockSupabase() {
     __inserts(table) {
       return inserts[table] || [];
     },
+    __updates(table) {
+      return updates[table] || [];
+    },
     __reset() {
       for (const k of Object.keys(queues)) delete queues[k];
       for (const k of Object.keys(inserts)) delete inserts[k];
+      for (const k of Object.keys(updates)) delete updates[k];
       storage.uploaded = [];
       storage.removed = [];
       storage.uploadFailAt = null;
