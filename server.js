@@ -473,8 +473,8 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
 // -- no new per-tenant column. Re-callable any time to correct/replace the split.
 app.patch('/api/properties/:id/deposit', verifyToken, async (req, res) => {
   try {
-    const { deposit_total, accept_suggestion, tenant_ids, source: requestedSource } = req.body;
-    const { data: prop } = await supabase.from('properties').select('id,deposit_suggested_total').eq('id', req.params.id).eq('user_id', req.userId).is('deleted_at', null).single();
+    const { deposit_total, accept_suggestion, tenant_ids, source: requestedSource, confirm_override } = req.body;
+    const { data: prop } = await supabase.from('properties').select('id,deposit_suggested_total,deposit_total,deposit_source').eq('id', req.params.id).eq('user_id', req.userId).is('deleted_at', null).single();
     if (!prop) return res.status(404).json({ error: 'Property not found' });
     let total, source;
     if (accept_suggestion) {
@@ -483,16 +483,33 @@ app.patch('/api/properties/:id/deposit', verifyToken, async (req, res) => {
     } else {
       total = parseFloat(deposit_total);
       if (!total || total <= 0) return res.status(400).json({ error: 'A positive deposit_total is required' });
+      if (total > 100000000) return res.status(400).json({ error: 'deposit_total is implausibly large' });
       source = 'manual';
     }
     // An explicit source in the body overrides the derived default above --
     // needed for the deterministic (non-AI) agreement-attach flow, which must
-    // never be recorded under the legacy AI-only 'agreement_ai' label.
+    // never be recorded under the legacy AI-only 'agreement_ai' label, and by
+    // the WhatsApp deposit-agreed apply form so a chat-derived figure is never
+    // recorded indistinguishably from a genuinely manual entry.
     if (requestedSource !== undefined) {
-      if (!['manual', 'agreement', 'agreement_ai'].includes(requestedSource)) {
-        return res.status(400).json({ error: 'source must be manual, agreement, or agreement_ai' });
+      if (!['manual', 'agreement', 'agreement_ai', 'whatsapp'].includes(requestedSource)) {
+        return res.status(400).json({ error: 'source must be manual, agreement, agreement_ai, or whatsapp' });
       }
       source = requestedSource;
+    }
+
+    // A signed-agreement figure is stronger provenance than a WhatsApp chat
+    // inference -- a WhatsApp-sourced apply that would silently change an
+    // already agreement-sourced total is blocked as a reviewable discrepancy
+    // instead, unless the caller explicitly confirms the override (the owner
+    // has been shown both values and chose to proceed anyway).
+    if (source === 'whatsapp' && prop.deposit_source === 'agreement' && prop.deposit_total != null
+      && Number(prop.deposit_total) !== total && !confirm_override) {
+      return res.status(409).json({
+        error: 'discrepancy',
+        message: 'This property already has an agreement-sourced deposit on record. Applying this WhatsApp figure would overwrite it.',
+        current_total: prop.deposit_total, current_source: prop.deposit_source, incoming_total: total
+      });
     }
 
     // Scoped assignment: only when the caller resolves specific tenant IDs
@@ -2497,6 +2514,20 @@ app.patch('/api/tenants/:id', verifyToken, requireOwner, async (req, res) => {
     for (const k of ['name', 'personal_email', 'personal_phone', 'age', 'gender', 'profession', 'employer', 'permanent_address', 'deposit_amount', 'deposit_paid_date', 'deposit_details', 'deposit_refunded_amount', 'deposit_refunded_date', 'police_verification_status', 'date_of_move_in', 'expected_date_of_move_out', 'actual_date_of_move_out', 'is_active', 'document_log', 'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relationship']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
+    // Narrow sanity check on the two deposit currency fields only -- this
+    // route was previously a completely unvalidated passthrough for them
+    // (name/email/etc. above are unaffected). Blank/null still clears the
+    // field as before; only an implausible non-blank value is rejected. The
+    // 500 floor matches parsers.js's own rent_amount lower bound -- a raw
+    // "4" (a "Deposit: 4 months" basis clause misread as a rupee figure,
+    // the real failure mode this guards against) is nowhere near a real
+    // Indian security deposit, and this route is a real WhatsApp apply-form
+    // destination (ApplyDepositEvent).
+    for (const k of ['deposit_amount', 'deposit_refunded_amount']) {
+      if (allowed[k] === undefined || allowed[k] === null || allowed[k] === '') continue;
+      const v = parseFloat(allowed[k]);
+      if (!(v >= 500) || v > 100000000) return res.status(400).json({ error: `${k} must be a positive, plausible amount` });
+    }
     const { data, error } = await supabase.from('tenants').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;
     res.json(data[0]);
@@ -2631,7 +2662,7 @@ function extractChatTextFromZip(buffer) {
 }
 const { extractWhatsAppFacts, WHATSAPP_CATEGORIES, WHATSAPP_FACT_TYPES } = require('./llm');
 const {
-  PARTICIPANT_ROLES, withEffectiveFields, applyDepositFirstSafetyNet, applyRepairOffsetSafetyNet
+  PARTICIPANT_ROLES, withEffectiveFields, applyDepositFirstSafetyNet, applyRepairOffsetSafetyNet, applyDepositBasisSafetyNet
 } = require('./whatsappFactResolution');
 
 // Defense-in-depth alongside the extraction prompt's own instruction: mask any
@@ -2703,13 +2734,22 @@ app.post('/api/whatsapp/import', verifyToken, upload.single('file'), async (req,
         const row = {
           import_id: importRow.id, category: f.category, fact_type: f.fact_type || null,
           value: redactLongDigitRuns(String(f.value)), confidence: typeof f.confidence === 'number' ? f.confidence : null,
-          evidence: redactLongDigitRuns(f.evidence || ''), message_seq: typeof f.message_seq === 'number' ? f.message_seq : null
+          evidence: redactLongDigitRuns(f.evidence || ''), message_seq: typeof f.message_seq === 'number' ? f.message_seq : null,
+          // Property-context inheritance: when the owner picked a property
+          // before/at import time, every fact from this import starts
+          // already linked to it -- never starts unlinked just because no
+          // per-fact choice has been made yet. Still fully overridable
+          // afterward via PATCH /api/whatsapp/facts/:id (property_id).
+          property_id: propertyId
         };
         // Deterministic safety net (server.js, not AI): never changes
-        // category/fact_type above, only pre-fills owner_corrected_* on the
+        // category/fact_type above, only pre-fills owner_corrected_* (and,
+        // for a months-basis deposit clause, basis_value/basis_unit) on the
         // same insert when applicable -- see applyDepositFirstSafetyNet/
-        // applyRepairOffsetSafetyNet for why.
-        return applyRepairOffsetSafetyNet(applyDepositFirstSafetyNet(row));
+        // applyRepairOffsetSafetyNet/applyDepositBasisSafetyNet for why.
+        // Basis runs last so month-basis phrasing always wins over the
+        // generic deposit-first default.
+        return applyDepositBasisSafetyNet(applyRepairOffsetSafetyNet(applyDepositFirstSafetyNet(row)));
       });
 
       // Merge into the same property's history instead of creating duplicate
@@ -2779,11 +2819,16 @@ app.get('/api/whatsapp/imports/:id', verifyToken, async (req, res) => {
   try {
     const { data: importRow } = await supabase.from('whatsapp_imports').select('*').eq('id', req.params.id).eq('user_id', req.userId).maybeSingle();
     if (!importRow) return res.status(404).json({ error: 'Import not found' });
-    const [{ data: messages }, { data: facts }] = await Promise.all([
+    const [{ data: messages }, { data: facts }, { data: owner }] = await Promise.all([
       supabase.from('whatsapp_messages').select('*').eq('import_id', req.params.id).order('seq', { ascending: true }),
-      supabase.from('whatsapp_extracted_facts').select('*').eq('import_id', req.params.id).order('created_at', { ascending: true })
+      supabase.from('whatsapp_extracted_facts').select('*').eq('import_id', req.params.id).order('created_at', { ascending: true }),
+      // The logged-in owner's own name -- this app has no multi-owner concept,
+      // so "the property's known owner" is always just the account itself.
+      // Used by the frontend to suggest (never auto-apply) participant_role
+      // 'owner' for a person-category fact whose text matches this name.
+      supabase.from('users').select('full_name').eq('id', req.userId).maybeSingle()
     ]);
-    res.json({ import: importRow, messages: messages || [], facts: facts || [] });
+    res.json({ import: importRow, messages: messages || [], facts: facts || [], owner_name: owner?.full_name || null });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -2799,6 +2844,15 @@ app.patch('/api/whatsapp/imports/:id', verifyToken, async (req, res) => {
     const { data, error } = await supabase.from('whatsapp_imports').update({ property_id: property_id || null }).eq('id', req.params.id).eq('user_id', req.userId).select();
     if (error) throw error;
     if (!data.length) return res.status(404).json({ error: 'Import not found' });
+    // Backfill inheritance: a fact that has never had its own property_id set
+    // (still null -- distinct from one an owner deliberately corrected) picks
+    // up this import's property the moment it's attached, same as facts
+    // extracted after a property was already chosen at upload time. Only
+    // still-null facts are touched -- an owner's own per-fact correction
+    // (including an explicit unlink) is never overwritten.
+    if (property_id) {
+      await supabase.from('whatsapp_extracted_facts').update({ property_id }).eq('import_id', req.params.id).is('property_id', null);
+    }
     res.json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2872,6 +2926,16 @@ app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) =
     // the same .eq('user_id', req.userId) regardless of which one it came
     // from, so a corrected property can never leak another owner's data.
     const propertyId = fact.property_id || fact.whatsapp_imports.property_id;
+    // The fact's own original source-message timestamp (never the import/
+    // row-insert time) -- resolved via message_seq, same join the Approvals
+    // list already does. null when message_seq doesn't resolve to a stored
+    // message; the frontend renders "Message date unavailable" for that
+    // case rather than silently showing nothing or substituting import time.
+    let messageTs = null;
+    if (fact.message_seq != null) {
+      const { data: msg } = await supabase.from('whatsapp_messages').select('ts').eq('import_id', fact.import_id).eq('seq', fact.message_seq).maybeSingle();
+      messageTs = msg?.ts || null;
+    }
     let property = null, tenants = [], obligations = [];
     if (propertyId) {
       const [{ data: p }, { data: t }, { data: o }] = await Promise.all([
@@ -2889,7 +2953,7 @@ app.get('/api/whatsapp/facts/:id/apply-context', verifyToken, async (req, res) =
       property = p; tenants = t || []; obligations = o || [];
     }
     delete fact.whatsapp_imports;
-    res.json({ fact: withEffectiveFields(fact), property, tenants, obligations });
+    res.json({ fact: withEffectiveFields(fact), property, tenants, obligations, message_ts: messageTs });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

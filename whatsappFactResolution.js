@@ -46,11 +46,37 @@ function applyRepairOffsetSafetyNet(fact) {
   return { ...fact, owner_corrected_fact_type: 'repair_rent_offset' };
 }
 
+// A WhatsApp deposit is very commonly stated as a multiple of rent ("Deposit:
+// 4 months") rather than a rupee figure. Without this net, a bare "4" reads
+// downstream as if it were a ₹4 deposit -- a real failure mode confirmed
+// against the Flat 512 import fixture. Structures it as {basis_value:4,
+// basis_unit:'months'} instead, a shape that the frontend deliberately has
+// no currency-apply path for (evidence/reference only, see index.jsx). Runs
+// LAST in the safety-net chain (server.js) so month-basis phrasing always
+// wins over applyDepositFirstSafetyNet's generic 'deposit_paid' default --
+// it reads the fact's ORIGINAL category, not owner_corrected_category, so
+// it fires the same whether the AI first called this 'payment' or 'deposit'.
+function applyDepositBasisSafetyNet(fact) {
+  if (fact.category !== 'payment' && fact.category !== 'deposit') return fact;
+  const text = `${fact.evidence || ''} ${fact.value || ''}`.toLowerCase();
+  if (!/\bdeposit\b/.test(text)) return fact;
+  const monthsMatch = text.match(/(\d{1,3})\s*(?:months?|mo\.?)\b/);
+  if (!monthsMatch) return fact;
+  return {
+    ...fact,
+    owner_corrected_category: 'deposit',
+    owner_corrected_fact_type: 'deposit_basis',
+    basis_value: parseInt(monthsMatch[1], 10),
+    basis_unit: 'months'
+  };
+}
+
 module.exports = {
   PARTICIPANT_ROLES,
   effectiveFactCategory,
   effectiveFactType,
   withEffectiveFields,
   applyDepositFirstSafetyNet,
-  applyRepairOffsetSafetyNet
+  applyRepairOffsetSafetyNet,
+  applyDepositBasisSafetyNet
 };
