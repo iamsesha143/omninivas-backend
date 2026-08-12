@@ -137,6 +137,7 @@ test('parseAgreementFactsFromText: missing/ambiguous fields are all null and an 
   assert.equal(facts.deposit_refundable, null);
   assert.equal(facts.maintenance_payer, null);
   assert.equal(facts.electricity_payer, null);
+  assert.equal(facts.rent_escalation_percent, null);
   assert.deepEqual(facts.fixtures, []);
 });
 

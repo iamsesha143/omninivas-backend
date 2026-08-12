@@ -695,6 +695,13 @@ app.post('/api/extract/property', verifyToken, upload.single('file'), async (req
         durationMonths: propertyData.agreement_months ?? (aiFacts.skipped ? null : aiFacts.duration_months),
         maintenancePayer, electricityPayer, paintingClause,
         depositTotal, depositRefundable: regexFacts.deposit_refundable,
+        // Reference-only: a written continuation/escalation clause (e.g. "7%
+        // increase after the written term if continued"). Never used to
+        // compute a rent figure anywhere server-side -- the frontend shows
+        // it purely as historical context alongside the written rent when
+        // the owner is asked to confirm the PRESENT rent for a still-current
+        // tenancy on an expired written term.
+        rentEscalationPercent: regexFacts.rent_escalation_percent,
         // Fittings/fixtures/appliances explicitly listed in the agreement --
         // maps to the move-in/appliances/handover area; the review step offers
         // a one-tap "add these to the appliance registry" action, never silent.
@@ -723,10 +730,22 @@ app.post('/api/extract/tenants', verifyToken, upload.single('file'), async (req,
   }
 });
 
+// Both tenant-creation routes below previously had NO property-ownership
+// check at all -- a valid JWT for ANY owner could POST a tenant against
+// ANY propertyId (only the inserted row's own user_id was ever set to the
+// caller, the property_id itself was never verified as theirs). Fixed the
+// same way as the precedented POST /api/properties/:propertyId/maintenance
+// fix above: a maybeSingle() ownership lookup (also excluding soft-deleted
+// properties) before any tenant read/write, and the shared notFound() helper
+// (a generic 404, no "not yours" distinction) so a cross-owner probe can't
+// learn whether a given property id exists at all, let alone what tenants
+// are on it.
 app.post('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => {
   try {
     const { name, personal_email, personal_phone, date_of_move_in, aadhar_card } = req.body;
     if (!name) return res.status(400).json({ error: 'Name required' });
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+    if (!property) return notFound(res);
     const { data, error } = await supabase.from('tenants').insert([{ property_id: req.params.propertyId, user_id: req.userId, name: name.trim(), personal_email: personal_email ? personal_email.trim().toLowerCase() : '', personal_phone: personal_phone ? personal_phone.trim() : '', aadhar_card: aadhar_card || null, date_of_move_in: date_of_move_in || new Date().toISOString().split('T')[0], occupancy_type: 'single', is_active: true }]).select();
     if (error) throw error;
     res.status(201).json(data[0]);
@@ -739,7 +758,9 @@ app.post('/api/properties/:propertyId/tenants/bulk', verifyToken, async (req, re
   try {
     const { tenants } = req.body;
     if (!Array.isArray(tenants) || tenants.length === 0) return res.status(400).json({ error: 'Tenants array required' });
-    const tenantsToInsert = tenants.map(t => ({
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+    if (!property) return notFound(res);
+    const candidates = tenants.map(t => ({
       property_id: req.params.propertyId,
       user_id: req.userId,
       name: (t.name || '').trim(),
@@ -748,12 +769,50 @@ app.post('/api/properties/:propertyId/tenants/bulk', verifyToken, async (req, re
       aadhar_card: t.aadhar_card || null,
       date_of_move_in: t.date_of_move_in || new Date().toISOString().split('T')[0],
       occupancy_type: 'single',
-      is_active: true
+      // Defaults to an active/current tenant, same as always. A caller may
+      // explicitly pass is_active:false (with actual_date_of_move_out) to
+      // save an already-expired agreement as a historical record instead --
+      // e.g. AttachAgreementPanel, when the extracted lease term has already
+      // ended and the owner hasn't confirmed the tenancy is still current.
+      is_active: t.is_active === false ? false : true,
+      actual_date_of_move_out: t.is_active === false ? (t.actual_date_of_move_out || null) : null
     })).filter(t => t.name);
-    if (tenantsToInsert.length === 0) return res.status(400).json({ error: 'No valid tenants: each tenant needs at least a name' });
-    const { data, error } = await supabase.from('tenants').insert(tenantsToInsert).select();
-    if (error) throw error;
-    res.status(201).json({ success: true, count: data.length, tenants: data });
+    if (candidates.length === 0) return res.status(400).json({ error: 'No valid tenants: each tenant needs at least a name' });
+
+    // Idempotency: a retried request (e.g. the client's first attempt
+    // actually reached the server and inserted rows, but the response was
+    // lost to a network drop, so the client retries the identical payload)
+    // must not create duplicate tenant rows. An exact case-insensitive name
+    // match against an already-active tenant on this same property is
+    // linked instead of re-inserted -- the frontend already makes this same
+    // new-vs-existing decision before the request is ever sent
+    // (AttachAgreementPanel's tenantChoices pre-resolution), so this is
+    // strictly a server-side safety net for the retry case, not a new
+    // decision point or a weakening of owner isolation (still scoped to
+    // this property_id + req.userId).
+    const { data: existing, error: existingErr } = await supabase.from('tenants')
+      .select('*').eq('property_id', req.params.propertyId).eq('user_id', req.userId).eq('is_active', true);
+    if (existingErr) throw existingErr;
+    const byName = new Map((existing || []).map(t => [t.name.trim().toLowerCase(), t]));
+
+    const toInsert = [];
+    const insertPositions = [];
+    const results = new Array(candidates.length).fill(null);
+    candidates.forEach((c, i) => {
+      const match = byName.get(c.name.toLowerCase());
+      if (match) results[i] = match;
+      else { toInsert.push(c); insertPositions.push(i); }
+    });
+
+    let inserted = [];
+    if (toInsert.length > 0) {
+      const { data, error } = await supabase.from('tenants').insert(toInsert).select();
+      if (error) throw error;
+      inserted = data || [];
+      insertPositions.forEach((pos, j) => { results[pos] = inserted[j]; });
+    }
+
+    res.status(201).json({ success: true, count: inserted.length, linked_count: candidates.length - inserted.length, tenants: results });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

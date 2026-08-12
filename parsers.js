@@ -196,14 +196,29 @@ const parseTenantsFromText = (text) => {
   // tenants extracted on a realistic sample agreement using this exact
   // phrasing). The "hereinafter ... lessee/tenant" keyword match stays
   // case-insensitive (documents often render it "LESSEE/TENANT" in caps), but
-  // the immediately-preceding name is validated separately with a
-  // case-SENSITIVE title-case check (a mixed-case regex under the same /i
-  // flag would also match ALL-CAPS boilerplate like "ONE PART" or "AND",
-  // since /i makes [a-z] match uppercase too) -- this two-step split is what
-  // keeps the Lessor's own name (tagged "LESSOR/OWNER" in the mirror clause
-  // just above) from ever being captured here.
-  for (const hm of text.matchAll(/\(hereinafter\s+(?:called|referred\s+to\s+as)[^)]{0,80}(lessee|tenant)[^)]*\)/gi)) {
-    const before = text.slice(Math.max(0, hm.index - 80), hm.index);
+  // the name is validated separately with a case-SENSITIVE title-case check
+  // (a mixed-case regex under the same /i flag would also match ALL-CAPS
+  // boilerplate like "ONE PART" or "AND", since /i makes [a-z] match
+  // uppercase too) -- this two-step split is what keeps the Lessor's own name
+  // (tagged "LESSOR/OWNER" in the mirror clause just above) from ever being
+  // captured here.
+  //
+  // The leading "(" is NOT required before "hereinafter" -- a real scanned
+  // agreement (Flat 512/Meda Heights fixture) phrases this as "Hereinafter
+  // called as the LESSEE (which expression..." where the parenthesis only
+  // wraps the trailing boilerplate, not the whole clause. And the name isn't
+  // always adjacent: that same real document has 4+ lines (S/o line, address,
+  // Aadhaar number) between "Mr. SHANKAR ABHINAV" and the "Hereinafter..."
+  // clause, so the backward search window is widened from 80 to 350 chars,
+  // with a "Mr./Mrs./Ms./M/s + ALL-CAPS name" pattern tried first (real-
+  // document style, tolerates the intervening lines by taking the LAST such
+  // title+name found in the window) before falling back to the original
+  // immediately-adjacent Title Case check (synthetic/clean-text style, where
+  // there's no title prefix at all).
+  for (const hm of text.matchAll(/hereinafter\s+(?:called|referred\s+to)(?:\s+as)?[^)]{0,100}?(lessee|tenant)\b/gi)) {
+    const before = text.slice(Math.max(0, hm.index - 350), hm.index).replace(/[\s(]+$/, '');
+    const titled = [...before.matchAll(/(?:Mr|Mrs|Ms|M\/s)\.?\s+([A-Z][A-Z ]{2,50}?)(?=\s*(?:\n|S\/?o\b|W\/?o\b|D\/?o\b|,|$))/g)];
+    if (titled.length) { addName(titled[titled.length - 1][1]); continue; }
     const nameMatch = before.match(/((?:[A-Z][a-z]+\.?\s+){0,4}[A-Z][a-z]+\.?)\s*$/);
     if (nameMatch) addName(nameMatch[1]);
   }
@@ -255,6 +270,8 @@ const FIXTURE_DEFS = [
   { name: 'Geyser', re: /geysers?/i },
   { name: 'Fan', re: /\bfans?\b/i },
   { name: 'Tube Light', re: /tube\s*lights?/i },
+  { name: 'Cloth Hanger', re: /cloth\s*hanger/i },
+  { name: 'Stove', re: /\bstoves?\b/i },
   { name: 'Wardrobe', re: /wardrobes?/i },
   { name: 'Air Conditioner', re: /\bA\/?Cs?\b|air[\s-]?condition(?:er)?s?/i },
   { name: 'Refrigerator', re: /refrigerator|fridge/i },
@@ -265,12 +282,15 @@ const FIXTURE_DEFS = [
 // A quantity phrased either before ("3 Fans") or after ("Fans - 3 Nos.") the
 // item name. No explicit count found near the mention -> singular (1), which
 // is also correct for an item listed on its own (e.g. "Geyser - 1 No.").
+// The optional "(?:&\s*[a-z]+\s*)?" before the separator tolerates a real
+// document's combined line item ("Tube Lights & Lights : 8 Nos.") where a
+// second fixture name is interposed between the matched name and its count.
 function extractQuantityNear(text, matchIndex, matchLength) {
   const before = text.slice(Math.max(0, matchIndex - 15), matchIndex);
-  const after = text.slice(matchIndex + matchLength, matchIndex + matchLength + 20);
+  const after = text.slice(matchIndex + matchLength, matchIndex + matchLength + 30);
   const beforeNum = before.match(/(\d{1,2})\s*(?:x\s*)?$/);
   if (beforeNum) return parseInt(beforeNum[1], 10);
-  const afterNum = after.match(/^\s*[-:]?\s*(\d{1,2})\s*(?:no\.?s?|nos\.?|units?|pieces?|pcs?)?\b/i);
+  const afterNum = after.match(/^\s*(?:&\s*[a-z]+\s*)?[-:]?\s*(\d{1,2})\s*(?:no\.?s?|nos\.?|units?|pieces?|pcs?)?\b/i);
   if (afterNum) return parseInt(afterNum[1], 10);
   return 1;
 }
@@ -281,13 +301,18 @@ const parseAgreementFactsFromText = (rawText) => {
     rent_amount: null, rent_due_day: null,
     deposit_total: null, deposit_refundable: null,
     maintenance_payer: null, electricity_payer: null,
+    rent_escalation_percent: null,
     fixtures: [], evidence: {}
   };
 
   // Rent amount: prefer a currency figure near the word "rent"; fall back to
-  // a currency figure near "per month"/"monthly rent" phrasing.
-  let rentMatch = text.match(/rent[\s\S]{0,60}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i);
-  if (!rentMatch) rentMatch = text.match(/(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?[\s\S]{0,40}?(?:per\s*month|monthly\s*rent|as\s*rent)/i);
+  // a currency figure near "per month"/"monthly rent" phrasing. Window widened
+  // from 60/40 to 150/80 chars: a real document's clause can read "The monthly
+  // rent payable by the Lessees to the Lessor for the Schedule Property shall
+  // be Rs. 38,000/-" -- ~95 chars between "rent" and the figure, well past the
+  // original tighter bound.
+  let rentMatch = text.match(/rent[\s\S]{0,150}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i);
+  if (!rentMatch) rentMatch = text.match(/(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?[\s\S]{0,80}?(?:per\s*month|monthly\s*rent|as\s*rent)/i);
   if (rentMatch) {
     const v = parseInt(rentMatch[1].replace(/,/g, ''), 10);
     if (v >= 500 && v <= 1000000) { out.rent_amount = v; out.evidence.rent_amount = cleanSpaces(rentMatch[0]); }
@@ -295,18 +320,44 @@ const parseAgreementFactsFromText = (rawText) => {
 
   // Rent due day: "on or before the 5th day of every ... month" style clauses,
   // falling back to a bare "Nth day of every month" or "rent due day: N".
-  const dueDayMatch = text.match(/(?:on or before|due on|payable on|by)\s+the\s+(\d{1,2})(?:st|nd|rd|th)?\s+(?:day\s+)?of\s+(?:every|each)\s+(?:[a-z]+\s+){0,2}month/i)
-    || text.match(/(\d{1,2})(?:st|nd|rd|th)?\s+(?:day\s+)?of\s+(?:every|each)\s+(?:[a-z]+\s+){0,2}month/i)
+  // "%" is accepted alongside the usual ordinal suffixes (st/nd/rd/th) because
+  // Tesseract OCR on a real scanned agreement misread a superscript "5th" as
+  // "5%" ("within 5% day of English Calendar month") -- a documented OCR
+  // artifact, not a new document format.
+  const dueDayMatch = text.match(/(?:on or before|due on|payable on|by)\s+the\s+(\d{1,2})(?:\s*(?:st|nd|rd|th|%))?\s+(?:day\s+)?of\s+(?:every|each)\s+(?:[a-z]+\s+){0,2}month/i)
+    || text.match(/within\s+(\d{1,2})(?:\s*(?:st|nd|rd|th|%))?\s+day\s+of\s+(?:every|each)?\s*(?:[a-z]+\s+){0,2}calendar\s+month/i)
+    || text.match(/(\d{1,2})(?:\s*(?:st|nd|rd|th|%))?\s+(?:day\s+)?of\s+(?:every|each)\s+(?:[a-z]+\s+){0,2}month/i)
     || text.match(/rent\s+due\s+(?:date|day)?\s*[:\-]?\s*(\d{1,2})(?:st|nd|rd|th)?/i);
   if (dueDayMatch) {
     const day = parseInt(dueDayMatch[1], 10);
     if (day >= 1 && day <= 31) { out.rent_due_day = day; out.evidence.rent_due_day = cleanSpaces(dueDayMatch[0]); }
   }
 
+  // Rent escalation/continuation clause -- e.g. "there will be 7% (Seven
+  // Percent) increase in the monthly rent after 11 months" if the tenant
+  // continues beyond the written term. Surfaced only as reference/history
+  // text (see server.js's agreementFacts.rentEscalationPercent) for the
+  // owner to consider when confirming a still-current tenancy's present
+  // rent -- this value is NEVER used to auto-calculate a new rent figure
+  // anywhere in this codebase. The clause is conditional on continuation,
+  // and this app has no evidence either way of whether it was actually
+  // applied, so only the owner's own confirmed present rent is ever treated
+  // as live.
+  const escalationMatch = text.match(/(\d{1,3})\s*%[\s\S]{0,60}?increase[\s\S]{0,60}?(?:rent|month)/i)
+    || text.match(/increase[\s\S]{0,60}?(\d{1,3})\s*%/i);
+  if (escalationMatch) {
+    const pct = parseInt(escalationMatch[1], 10);
+    if (pct >= 1 && pct <= 100) { out.rent_escalation_percent = pct; out.evidence.rent_escalation_percent = cleanSpaces(escalationMatch[0]); }
+  }
+
   // Deposit total + refundable status, the latter read from the sentence the
   // amount itself was found in (never inferred from elsewhere in the document).
-  const depositMatch = text.match(/security\s+deposit[\s\S]{0,80}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i)
-    || text.match(/deposit[\s\S]{0,80}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i);
+  // Window widened from 80 to 150 chars for the same reason as rent above --
+  // a real clause reads "DEPOSIT; Whereas the LESSOR has leased the schedule
+  // premises to the LESSEE for a consideration amount of Rs. 1,52,000/-",
+  // ~100 chars between "deposit" and the figure.
+  const depositMatch = text.match(/security\s+deposit[\s\S]{0,150}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i)
+    || text.match(/deposit[\s\S]{0,150}?(?:₹|rs\.?|inr)\s*([\d,]+)(?:\/-)?/i);
   if (depositMatch) {
     const v = parseInt(depositMatch[1].replace(/,/g, ''), 10);
     if (v >= 500 && v <= 100000000) {
@@ -317,12 +368,24 @@ const parseAgreementFactsFromText = (rawText) => {
     }
   }
 
-  // Maintenance/electricity responsibility: "<keyword> ... shall be borne/paid
-  // by the tenant/lessee/owner/lessor". tenant and lessee both normalize to
+  // Maintenance/electricity responsibility. Two sentence forms are checked:
+  // Form A -- "<keyword> ... shall be borne/paid ... by the tenant/lessee/
+  // owner/lessor" (verb-then-party), tolerating a bounded interposed clause
+  // between the verb and "by" (a real document reads "...shall be paid
+  // directly to the concerned department regularly by the Lessee", not
+  // "paid by the Lessee" adjacently). Form B -- "<party> has to pay/shall
+  // pay/is responsible for ... <keyword>" (party-before-verb, the reverse
+  // order), needed because a real clause reads "The Lessee has to pay actual
+  // amount as per association towards maintenance charges" with no
+  // "borne/paid by" construction at all. tenant and lessee both normalize to
   // 'tenant'; owner and lessor (and landlord) both normalize to 'owner'.
   const findPayer = (keywordRe) => {
-    const re = new RegExp(`${keywordRe.source}[\\s\\S]{0,150}?(?:shall\\s+be\\s+(?:borne(?:\\s+and\\s+paid)?|paid)|to\\s+be\\s+(?:borne|paid)|payable|borne)\\s+by\\s+(?:the\\s+)?(tenant|lessee|owner|lessor|landlord)`, 'i');
-    const mm = text.match(re);
+    const formA = new RegExp(`${keywordRe.source}[\\s\\S]{0,150}?(?:shall\\s+be\\s+(?:borne(?:\\s+and\\s+paid)?|paid)|to\\s+be\\s+(?:borne|paid)|payable|borne)[\\s\\S]{0,80}?\\bby\\s+(?:the\\s+)?(tenant|lessee|owner|lessor|landlord)\\b`, 'i');
+    let mm = text.match(formA);
+    if (!mm) {
+      const formB = new RegExp(`\\b(tenant|lessee|owner|lessor|landlord)\\b[\\s\\S]{0,80}?(?:has\\s+to\\s+pay|shall\\s+pay|is\\s+responsible\\s+for|will\\s+pay)[\\s\\S]{0,80}?${keywordRe.source}`, 'i');
+      mm = text.match(formB);
+    }
     if (!mm) return null;
     const who = mm[1].toLowerCase();
     return { payer: (who === 'tenant' || who === 'lessee') ? 'tenant' : 'owner', evidence: cleanSpaces(mm[0]) };
