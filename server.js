@@ -19,6 +19,7 @@ const mw = require('./maintenanceWorkflow');
 const uploadValidation = require('./uploadValidation');
 const reminders = require('./reminders');
 const { todayISOInTimezone, dueDateForExplicitMonth, daysInMonth } = require('./dateUtils');
+const aiGateway = require('./aiGateway');
 const notifications = require('./notifications');
 
 const app = express();
@@ -326,6 +327,37 @@ app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
     if (error) throw error;
     res.json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Owner-only diagnostic for the dormant AI gateway (agreement summaries,
+// deposit suggestion, move-out deduction assistant, WhatsApp fact
+// extraction all route through it -- see aiGateway.js). Never exposes the
+// key, gateway URL, request headers, prompts, or raw gateway response --
+// only whether it's configured, and (only when configured) the non-secret
+// provider/model identifiers already visible in aiGateway.js's own console
+// warning. Provider/model defaults mirror aiGateway.js's own fallbacks
+// intentionally, rather than importing them, to keep this a read-only
+// consumer of that module's public isConfigured()/run() surface.
+// ?probe=true additionally runs one real, fixed, non-sensitive prompt
+// through aiGateway.run() and reports only ok/failed -- never the response
+// text. Not called automatically anywhere; fires only on an explicit
+// owner-authenticated request.
+app.get('/api/settings/ai-status', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const configured = aiGateway.isConfigured();
+    const response = { configured };
+    if (configured) {
+      response.provider = process.env.AI_GATEWAY_PROVIDER || 'groq';
+      response.model = process.env.AI_GATEWAY_MODEL || 'llama-3.1-8b-instant';
+    }
+    if (req.query.probe === 'true') {
+      const probeResult = await aiGateway.run('Reply with the single word OK.', { maxTokens: 5 });
+      response.probe = probeResult.ok ? 'ok' : 'failed';
+    }
+    res.json(response);
+  } catch (err) {
+    res.status(500).json({ error: 'Unable to determine AI status right now.' });
+  }
 });
 
 const FEEDBACK_CATEGORIES = ['bug', 'feature_request', 'question', 'other'];
