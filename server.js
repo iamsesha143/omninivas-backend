@@ -21,6 +21,7 @@ const reminders = require('./reminders');
 const { todayISOInTimezone, dueDateForExplicitMonth, daysInMonth } = require('./dateUtils');
 const aiGateway = require('./aiGateway');
 const notifications = require('./notifications');
+const backupCore = require('./backupCore');
 
 const app = express();
 
@@ -357,6 +358,29 @@ app.get('/api/settings/ai-status', verifyToken, requireOwner, async (req, res) =
     res.json(response);
   } catch (err) {
     res.status(500).json({ error: 'Unable to determine AI status right now.' });
+  }
+});
+
+// Machine-to-machine trigger for the daily DB backup (see backupCore.js). No
+// JWT here deliberately -- the caller is an unattended GitHub Actions cron
+// job, not a logged-in owner, so it authenticates with a static shared
+// secret instead. timingSafeEqual guards against a timing side-channel on
+// the secret comparison; the length check first avoids it throwing on
+// mismatched buffer lengths.
+app.post('/api/admin/backup', async (req, res) => {
+  const provided = req.get('x-backup-secret') || '';
+  const expected = process.env.BACKUP_SECRET || '';
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const result = await backupCore.runBackup();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('backup failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Backup failed' });
   }
 });
 

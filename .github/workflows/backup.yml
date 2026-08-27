@@ -1,0 +1,16 @@
+name: Daily database backup
+
+on:
+  schedule:
+    # 21:00 UTC = ~2:30am IST, low-traffic window
+    - cron: '0 21 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  trigger-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call backup endpoint
+        run: |
+          curl -sf -X POST "https://omninivas-backend-production.up.railway.app/api/admin/backup" \
+            -H "x-backup-secret: ${{ secrets.BACKUP_SECRET }}"
