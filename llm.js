@@ -17,14 +17,15 @@ const aiGateway = require('./aiGateway');
 async function summarizeAgreement(text) {
   if (!aiGateway.isConfigured() || !text || text.trim().length < 50) return { skipped: true, summary: null };
   const prompt = `You are helping an Indian landlord who will ALSO see these facts already pulled out separately and shown as individual fields: monthly rent, security deposit, lease duration, who pays maintenance, who pays electricity, any painting clause, and any fixtures/appliances listed. Do NOT restate those as plain sentences and do NOT reproduce or paraphrase large chunks of the agreement text.\n\nInstead, in 2-4 short bullet points, surface ONLY things that matter but aren't captured by those simple fields, for example: unusual or one-sided clauses, penalty/lock-in terms, rent escalation clauses, sub-letting restrictions, anything that could surprise the owner or tenant later, or a brief note on the practical implication of a clause. If the agreement is entirely standard with nothing else worth flagging, say so in one line -- do not pad with restatements just to fill space.\n\nOnly state what is explicitly present in the text below -- never infer or guess a detail that isn't there.\n\nAgreement text:\n\n${text.slice(0, 16000)}`;
-  // 700, not 350: openai/gpt-oss-20b (the current default model, since
-  // 2026-08-27) is a reasoning-style model that spends part of its token
-  // budget on internal reasoning before the visible answer -- 350 was tuned
-  // against the older non-reasoning llama-3.1-8b-instant and left too little
-  // room, causing the gateway to return empty content (confirmed live:
-  // aiGateway.js logged "gateway response had no recognizable text field"
-  // on a real production test upload).
-  const res = await aiGateway.run(prompt, { maxTokens: 700 });
+  // 1500, not 350: openai/gpt-oss-20b (the current default model, since
+  // 2026-08-27) is a reasoning-style model that spends a meaningful chunk
+  // of its token budget on internal reasoning before the visible answer.
+  // 350 (tuned against the older non-reasoning llama-3.1-8b-instant)
+  // produced empty output; 700 produced real but visibly truncated output
+  // (cut off mid-sentence, only part of one of the requested 2-4 bullets) --
+  // both confirmed live via real production test uploads. Matches
+  // compareMoveInOut's existing 1200 as a reference point, plus headroom.
+  const res = await aiGateway.run(prompt, { maxTokens: 1500 });
   if (!res.ok) return { skipped: true, summary: null };
   return { skipped: false, summary: res.text };
 }
