@@ -27,9 +27,13 @@ function extractText(data) {
   );
 }
 
-async function run(prompt, { maxTokens = 1000, timeoutMs = 20000 } = {}) {
-  if (!configured || !prompt) return { ok: false };
-
+// One HTTP attempt. `retryable` distinguishes failures worth retrying (an
+// otherwise-good response that came back empty -- confirmed live, 2026-08-27,
+// as genuine run-to-run flakiness on identical requests; also 429/5xx, the
+// classic transient-failure signals) from failures that won't fix themselves
+// on a second try (401/400-class errors, or a timeout that already burned
+// the full wait).
+async function attempt(prompt, { maxTokens, timeoutMs }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -56,7 +60,7 @@ async function run(prompt, { maxTokens = 1000, timeoutMs = 20000 } = {}) {
 
     if (!res.ok) {
       console.warn(`aiGateway.js: gateway returned ${res.status}`);
-      return { ok: false };
+      return { ok: false, retryable: res.status === 429 || res.status >= 500 };
     }
 
     const data = await res.json().catch(() => null);
@@ -64,15 +68,26 @@ async function run(prompt, { maxTokens = 1000, timeoutMs = 20000 } = {}) {
 
     if (!text) {
       console.warn('aiGateway.js: gateway response had no recognizable text field');
-      return { ok: false };
+      return { ok: false, retryable: true };
     }
 
     return { ok: true, text };
   } catch (err) {
     clearTimeout(timeout);
     console.warn('aiGateway.js: request failed:', err.name === 'AbortError' ? 'timed out' : err.message);
-    return { ok: false };
+    return { ok: false, retryable: false };
   }
+}
+
+async function run(prompt, { maxTokens = 1000, timeoutMs = 20000 } = {}) {
+  if (!configured || !prompt) return { ok: false };
+
+  const first = await attempt(prompt, { maxTokens, timeoutMs });
+  if (first.ok || !first.retryable) return { ok: first.ok, text: first.text };
+
+  console.warn('aiGateway.js: retrying once after a retryable failure');
+  const second = await attempt(prompt, { maxTokens, timeoutMs });
+  return { ok: second.ok, text: second.text };
 }
 
 module.exports = { run, isConfigured };
