@@ -153,6 +153,17 @@ const requireOwner = (req, res, next) => {
   next();
 };
 
+// User-controlled strings (property names, tenant names, obligation labels,
+// owner full_name/email) get interpolated directly into hand-built HTML
+// responses in a few places below (CA export, rent receipt) -- this is what
+// stands between a property named e.g. "<script>..." and stored XSS in a
+// page an owner or their CA opens.
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // Standard error responses for the maintenance/equipment/vendor/rent-credit
 // routes (migration 014 and everything built on it). A cross-owner or
 // cross-tenant lookup and a genuinely nonexistent resource both produce this
@@ -1902,10 +1913,10 @@ app.get('/api/reports/ca-export/print', verifyToken, requireOwner, async (req, r
     ]);
     const { fy, cashReceived, expensesPaid, netCashFlow, transactions, propertyBreakdown, deposits, tds } = data;
 
-    const rows = transactions.map(t => `<tr><td>${t.date}</td><td>${t.property_name}</td><td>${t.label}</td><td style="text-align:right;color:${t.direction === 'income' ? '#166534' : '#991b1b'}">${t.direction === 'income' ? '+' : '−'}₹${t.amount.toLocaleString('en-IN')}</td></tr>`).join('');
-    const propRows = propertyBreakdown.map(p => `<tr><td>${p.property_name}</td><td style="text-align:right">₹${p.income.toLocaleString('en-IN')}</td><td style="text-align:right">₹${p.expenses.toLocaleString('en-IN')}</td><td style="text-align:right;font-weight:600">₹${p.net.toLocaleString('en-IN')}</td></tr>`).join('');
-    const depositRows = deposits.map(d => `<tr><td>${d.tenant_name}</td><td>${d.property_name}</td><td style="text-align:right">₹${d.agreed_amount.toLocaleString('en-IN')}</td><td>${d.status.replace(/_/g, ' ')}</td></tr>`).join('');
-    const tdsNote = tds.length ? `<div class="box" style="border-color:#f59e0b;background:#fffbeb"><b>Note</b><ul>${tds.map(t => `<li>${t.property_name}: ₹${t.monthly_rent.toLocaleString('en-IN')}/mo — ${t.note}</li>`).join('')}</ul></div>` : '';
+    const rows = transactions.map(t => `<tr><td>${escapeHtml(t.date)}</td><td>${escapeHtml(t.property_name)}</td><td>${escapeHtml(t.label)}</td><td style="text-align:right;color:${t.direction === 'income' ? '#166534' : '#991b1b'}">${t.direction === 'income' ? '+' : '−'}₹${t.amount.toLocaleString('en-IN')}</td></tr>`).join('');
+    const propRows = propertyBreakdown.map(p => `<tr><td>${escapeHtml(p.property_name)}</td><td style="text-align:right">₹${p.income.toLocaleString('en-IN')}</td><td style="text-align:right">₹${p.expenses.toLocaleString('en-IN')}</td><td style="text-align:right;font-weight:600">₹${p.net.toLocaleString('en-IN')}</td></tr>`).join('');
+    const depositRows = deposits.map(d => `<tr><td>${escapeHtml(d.tenant_name)}</td><td>${escapeHtml(d.property_name)}</td><td style="text-align:right">₹${d.agreed_amount.toLocaleString('en-IN')}</td><td>${escapeHtml(d.status.replace(/_/g, ' '))}</td></tr>`).join('');
+    const tdsNote = tds.length ? `<div class="box" style="border-color:#f59e0b;background:#fffbeb"><b>Note</b><ul>${tds.map(t => `<li>${escapeHtml(t.property_name)}: ₹${t.monthly_rent.toLocaleString('en-IN')}/mo — ${escapeHtml(t.note)}</li>`).join('')}</ul></div>` : '';
 
     res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>OMniNivas — CA Export ${fy.label}</title>
 <style>
@@ -1923,7 +1934,7 @@ td{padding:.35rem .4rem;border-bottom:1px solid #e5e7eb}
 @media print{.noprint{display:none}}
 </style></head><body>
 <h1>OMniNivas — Financial Summary for Your Chartered Accountant</h1>
-<p>Owner: ${owner ? (owner.full_name || owner.email) : ''} · Financial Year: ${fy.label} (${fy.start} to ${fy.end}) · Generated ${new Date().toLocaleDateString('en-IN')}</p>
+<p>Owner: ${escapeHtml(owner ? (owner.full_name || owner.email) : '')} · Financial Year: ${fy.label} (${fy.start} to ${fy.end}) · Generated ${new Date().toLocaleDateString('en-IN')}</p>
 
 <div class="summary">
   <div><div>Rent &amp; income received</div><div class="n" style="color:#166534">₹${cashReceived.toLocaleString('en-IN')}</div></div>
@@ -1956,7 +1967,16 @@ app.get('/api/reports/ca-export/csv', verifyToken, requireOwner, async (req, res
     const data = await buildCaExportData(req.userId, startYear);
     const { fy, transactions, propertyBreakdown, cashReceived, expensesPaid, netCashFlow } = data;
 
-    const esc = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
+    // A property/label value starting with =, +, -, @, tab, or CR can be
+    // interpreted as a formula by Excel/Sheets when this CSV is opened --
+    // classic CSV/formula-injection. Prefixing with a leading single quote
+    // forces spreadsheet apps to treat it as literal text; it's invisible
+    // in the rendered cell, not a visible artifact in the data.
+    const esc = (s) => {
+      let v = String(s ?? '');
+      if (/^[=+\-@\t\r]/.test(v)) v = `'${v}`;
+      return `"${v.replace(/"/g, '""')}"`;
+    };
     const lines = [];
     lines.push(esc(`OMniNivas CA Export — ${fy.label} (${fy.start} to ${fy.end})`));
     lines.push('');
@@ -2193,13 +2213,13 @@ table{width:100%;margin-top:1rem;border-collapse:collapse}td{padding:.4rem 0;ver
 @media print{.noprint{display:none}}</style></head><body>
 <div class="box"><h1>RENT RECEIPT ${period ? '— ' + period : ''}</h1><table>
 <tr><td>Receipt No.</td><td>${p.id.slice(0, 8).toUpperCase()}</td></tr>
-<tr><td>Received from</td><td>${tenant ? tenant.name : '—'}</td></tr>
+<tr><td>Received from</td><td>${escapeHtml(tenant ? tenant.name : '—')}</td></tr>
 <tr><td>Amount</td><td class="amount">₹${Number(p.amount).toLocaleString('en-IN')}</td></tr>
-<tr><td>Towards</td><td>Rent for ${prop ? prop.property_name : ''}${period ? ', ' + period : ''}</td></tr>
-<tr><td>Property</td><td>${prop ? [prop.street_address, prop.city, prop.state, prop.pincode].filter(Boolean).join(', ') : ''}</td></tr>
+<tr><td>Towards</td><td>Rent for ${escapeHtml(prop ? prop.property_name : '')}${period ? ', ' + period : ''}</td></tr>
+<tr><td>Property</td><td>${escapeHtml(prop ? [prop.street_address, prop.city, prop.state, prop.pincode].filter(Boolean).join(', ') : '')}</td></tr>
 <tr><td>Payment date</td><td>${p.payment_date || ''}</td></tr>
-${p.utr_number ? `<tr><td>UTR / Ref</td><td>${p.utr_number}</td></tr>` : ''}
-<tr><td>Received by (Owner)</td><td>${owner ? (owner.full_name || owner.email) : ''}</td></tr>
+${p.utr_number ? `<tr><td>UTR / Ref</td><td>${escapeHtml(p.utr_number)}</td></tr>` : ''}
+<tr><td>Received by (Owner)</td><td>${escapeHtml(owner ? (owner.full_name || owner.email) : '')}</td></tr>
 </table><p class="foot">Generated by OMniNivas on ${new Date().toLocaleDateString('en-IN')}. This receipt can be used for HRA claims.</p></div>
 <p class="noprint" style="text-align:center;margin-top:1rem"><button onclick="window.print()" style="padding:.6rem 2rem;font-size:1rem;cursor:pointer">Print / Save as PDF</button></p>
 </body></html>`);

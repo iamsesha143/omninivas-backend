@@ -130,6 +130,37 @@ test('csv route: correct headers and content, including proper escaping of a com
   assert.match(csv, /"Rent, monthly"/); // comma-containing label correctly quoted, not split into two fields
 });
 
+test('csv route: a property name starting with = is defused with a leading quote (CSV formula injection)', async () => {
+  seedFyData({
+    properties: [{ id: 'p1', property_name: '=1+1' }],
+    obligations: [{ id: 'ob1', property_id: 'p1', paid_by: 'tenant', label: '@SUM(A1)', type: 'rent', amount: 20000 }],
+    payments: [{ id: 'pay1', property_id: 'p1', obligation_id: 'ob1', amount: 20000, payment_date: '2026-06-05', period: '2026-06-01', status: 'paid' }]
+  });
+
+  const res = await fetch(`${baseUrl}/api/reports/ca-export/csv?year=2026`, { headers: { Authorization: `Bearer ${ownerToken}` } });
+  const csv = await res.text();
+
+  assert.match(csv, /"'=1\+1"/); // leading-= value prefixed with a quote before the =
+  assert.match(csv, /"'@SUM\(A1\)"/); // leading-@ value likewise defused
+});
+
+test('print route: a property name containing HTML is escaped, not rendered as markup', async () => {
+  seedFyData({
+    properties: [{ id: 'p1', property_name: '<script>alert(1)</script>' }],
+    obligations: [{ id: 'ob1', property_id: 'p1', paid_by: 'tenant', label: 'Rent', type: 'rent', amount: 20000 }],
+    payments: [{ id: 'pay1', property_id: 'p1', obligation_id: 'ob1', amount: 20000, payment_date: '2026-06-05', period: '2026-06-01', status: 'paid' }]
+  });
+  mockDb.__queue('users', { data: { full_name: '<img src=x onerror=alert(2)>', email: 'o@test.com' }, error: null });
+
+  const res = await fetch(`${baseUrl}/api/reports/ca-export/print?year=2026`, { headers: { Authorization: `Bearer ${ownerToken}` } });
+  const html = await res.text();
+
+  assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<img src=x onerror=alert\(2\)>/);
+  assert.match(html, /&lt;img src=x onerror=alert\(2\)&gt;/);
+});
+
 test('both routes: an empty year (no transactions at all) still returns 200 with a clean empty report', async () => {
   seedFyData();
   mockDb.__queue('users', { data: { full_name: 'Owner', email: 'o@test.com' }, error: null });
