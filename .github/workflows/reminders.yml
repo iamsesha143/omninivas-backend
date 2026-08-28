@@ -1,0 +1,16 @@
+name: Daily reminder generation
+
+on:
+  schedule:
+    # 03:00 UTC = ~8:30am IST -- notifications ready before the day starts
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  trigger-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call run-reminders endpoint
+        run: |
+          curl -sf -X POST "https://omninivas-backend-production.up.railway.app/api/admin/run-reminders" \
+            -H "x-reminders-secret: ${{ secrets.REMINDERS_SECRET }}"

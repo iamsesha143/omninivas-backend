@@ -132,7 +132,7 @@ test('insertNewNotifications: inserts new rows and reports an accurate created c
     { dedupe_key: 'k2', category: 'warranty_expiry', recipient_user_id: 'owner-1' }
   ];
   const created = await job.insertNewNotifications(supabase, toInsert);
-  assert.equal(created, 2);
+  assert.equal(created.length, 2);
   assert.equal(supabase.__tables.notifications.length, 2);
 });
 
@@ -141,14 +141,14 @@ test('insertNewNotifications: a duplicate dedupe_key against an existing row cre
     notifications: [{ id: 'existing', dedupe_key: 'k1', category: 'warranty_expiry', status: 'unread' }]
   }));
   const created = await job.insertNewNotifications(supabase, [{ dedupe_key: 'k1', category: 'warranty_expiry', recipient_user_id: 'owner-1' }]);
-  assert.equal(created, 0);
+  assert.equal(created.length, 0);
   assert.equal(supabase.__tables.notifications.length, 1); // still just the one row
 });
 
 test('insertNewNotifications: empty input writes nothing and makes no query', async () => {
   const supabase = createInMemorySupabase(baseTables());
   const created = await job.insertNewNotifications(supabase, []);
-  assert.equal(created, 0);
+  assert.equal(created.length, 0);
   assert.equal(supabase.__tables.notifications.length, 0);
 });
 
@@ -162,7 +162,7 @@ test('runOnce: dry-run computes candidates but writes nothing at all', async () 
   });
   const supabase = createInMemorySupabase(tables);
   const wouldCreate = await job.runOnce(supabase, '2026-08-15', true);
-  assert.ok(wouldCreate >= 1);
+  assert.ok(wouldCreate.created >= 1);
   assert.equal(supabase.__tables.notifications.length, 0); // nothing written
   assert.equal(supabase.__tables.reminder_job_runs.length, 0); // no job-run row in dry-run either
 });
@@ -175,7 +175,7 @@ test('runOnce: a real run creates the expected row(s)', async () => {
   });
   const supabase = createInMemorySupabase(tables);
   const created = await job.runOnce(supabase, '2026-08-15', false);
-  assert.equal(created, 1);
+  assert.equal(created.created, 1);
   assert.equal(supabase.__tables.notifications.length, 1);
   assert.equal(supabase.__tables.notifications[0].category, 'rent_due');
 });
@@ -189,8 +189,8 @@ test('runOnce: running twice on the same day creates no duplicate notifications'
   const supabase = createInMemorySupabase(tables);
   const firstRun = await job.runOnce(supabase, '2026-08-15', false);
   const secondRun = await job.runOnce(supabase, '2026-08-15', false);
-  assert.equal(firstRun, 1);
-  assert.equal(secondRun, 0); // second run: everything already exists, dedupe blocks it
+  assert.equal(firstRun.created, 1);
+  assert.equal(secondRun.created, 0); // second run: everything already exists, dedupe blocks it
   assert.equal(supabase.__tables.notifications.length, 1); // still exactly one row total
 });
 
@@ -208,7 +208,7 @@ test('runOnce: a payment recorded between two runs suppresses the second run and
   supabase.__tables.payments.push({ id: 'pay1', obligation_id: 'ob1', period: '2026-08-01', status: 'paid' });
 
   const secondRun = await job.runOnce(supabase, '2026-08-18', false); // would be the -2-day reminder
-  assert.equal(secondRun, 0); // no new reminder generated once paid
+  assert.equal(secondRun.created, 0); // no new reminder generated once paid
   const rows = supabase.__tables.notifications;
   assert.equal(rows.filter(n => n.status === 'invalidated').length, 1); // the earlier one is invalidated
   assert.equal(rows.find(n => n.status === 'invalidated').invalidation_reason, 'obligation_paid');
@@ -261,7 +261,7 @@ test('runOnce: a warranty_end edit invalidates the old-dated reminder and makes 
 
   // 2_months before the NEW date -> fresh eligible row, exactly one.
   const created = await job.runOnce(supabase, '2026-07-10', false);
-  assert.equal(created, 1);
+  assert.equal(created.created, 1);
   assert.ok(supabase.__tables.notifications.some(n => n.event_date === '2026-09-10' && n.status === 'unread'));
 });
 
@@ -340,7 +340,7 @@ test('catch-up: a one-day missed run still creates the reminder the next day, wi
   // The job resumes one day late, on 2026-10-10 (missed running on 10-09,
   // the 7_days slot's exact date).
   const created = await job.runOnce(supabase, '2026-10-10', false);
-  assert.equal(created, 1);
+  assert.equal(created.created, 1);
   assert.equal(supabase.__tables.notifications.length, 4); // 3 pre-existing + exactly 1 new
   const newRow = supabase.__tables.notifications.find(n => n.id !== undefined && !n.id.startsWith('existing-'));
   assert.equal(newRow.offset_label, '7_days');
@@ -358,7 +358,7 @@ test('catch-up: a multi-day missed run creates every missed warranty/agreement s
   // later, on 2026-10-05: 2_months(Aug16), 1_month(Sep16), and
   // 15_days(Oct1) have all elapsed; 7_days(Oct9) has not yet.
   const created = await job.runOnce(supabase, '2026-10-05', false);
-  assert.equal(created, 3);
+  assert.equal(created.created, 3);
   const labels = supabase.__tables.notifications.map(n => n.offset_label).sort();
   assert.deepEqual(labels, ['15_days', '1_month', '2_months']);
 });
@@ -371,8 +371,8 @@ test('catch-up: running again the same day after catch-up creates no duplicate r
   const supabase = createInMemorySupabase(tables);
   const firstRun = await job.runOnce(supabase, '2026-10-05', false);
   const secondRun = await job.runOnce(supabase, '2026-10-05', false);
-  assert.equal(firstRun, 3);
-  assert.equal(secondRun, 0);
+  assert.equal(firstRun.created, 3);
+  assert.equal(secondRun.created, 0);
   assert.equal(supabase.__tables.notifications.length, 3); // still exactly three rows total
 });
 
@@ -393,7 +393,7 @@ test('catch-up: a retry after partial success completes only the missing rows, n
   });
   const supabase = createInMemorySupabase(tables);
   const created = await job.runOnce(supabase, '2026-10-05', false);
-  assert.equal(created, 2); // only 1_month + 15_days -- 2_months already existed
+  assert.equal(created.created, 2); // only 1_month + 15_days -- 2_months already existed
   assert.equal(supabase.__tables.notifications.length, 3); // 1 pre-existing + 2 new, never 4
   assert.equal(supabase.__tables.notifications.filter(n => n.offset_label === '2_months').length, 1); // never duplicated
 });
@@ -405,7 +405,7 @@ test('catch-up: no stale warranty reminder is created once already expired, even
   });
   const supabase = createInMemorySupabase(tables);
   const created = await job.runOnce(supabase, '2027-01-01', false); // months after expiry
-  assert.equal(created, 0);
+  assert.equal(created.created, 0);
   assert.equal(supabase.__tables.notifications.length, 0);
 });
 
@@ -422,7 +422,7 @@ test('catch-up: a paid rent obligation suppresses every missed advance reminder,
   // Resuming right on the due date, where 5d/2d/due-date would all
   // otherwise be eligible for catch-up.
   const created = await job.runOnce(supabase, '2026-08-20', false);
-  assert.equal(created, 0);
+  assert.equal(created.created, 0);
   assert.equal(supabase.__tables.notifications.length, 0);
 });
 

@@ -21,6 +21,17 @@ const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const reminders = require('../reminders');
 const { todayISOInTimezone } = require('../dateUtils');
+const whatsappSender = require('../whatsappSender');
+const notifications = require('../notifications');
+
+// Only these two categories map to the WhatsApp consent copy shown to users
+// ("Rent due and overdue reminders, move-in/move-out handover updates,
+// maintenance notices") -- rent_due notifies the tenant, rent_overdue
+// notifies the owner (see reminders.js), each gated by their OWN
+// whatsapp_enabled flag. Not every notification category becomes a
+// WhatsApp message; warranty/agreement/maintenance/settlement stay in-app
+// only for now.
+const WHATSAPP_ELIGIBLE_CATEGORIES = new Set(['rent_due', 'rent_overdue']);
 
 const DRY_RUN = process.argv.includes('--dry-run');
 
@@ -132,13 +143,56 @@ async function applyInvalidation(supabase, instr) {
 // the same reminder twice," not just a courtesy application-level check.
 // .select('id') after an ignoreDuplicates upsert returns only the rows that
 // were actually newly inserted, giving an accurate created-count.
+// Returns the actually-newly-inserted rows (not just a count) -- the
+// WhatsApp dark-send step below must only act on genuinely new
+// notifications, never the full toInsert candidate list, which recomputes
+// the same candidates every run regardless of dedupe. Sending (even darkly)
+// once per candidate-recompute instead of once per real insert would spam
+// the log daily for the same reminder instead of once per ladder step.
 async function insertNewNotifications(supabase, toInsert) {
-  if (toInsert.length === 0) return 0;
+  if (toInsert.length === 0) return [];
   const { data, error } = await supabase.from('notifications')
     .upsert(toInsert, { onConflict: 'dedupe_key', ignoreDuplicates: true })
-    .select('id');
+    .select('id, recipient_user_id, category, title, body, deep_link');
   if (error) throw error;
-  return (data || []).length;
+  return data || [];
+}
+
+// Dark-mode WhatsApp fan-out (see whatsappSender.js). For each newly-created
+// notification in an eligible category, checks the recipient's own
+// whatsapp_enabled consent flag and -- only if set -- calls
+// whatsappSender.send() (a no-op logger until real BSP credentials exist)
+// and records the attempt in whatsapp_notifications regardless of dark/real,
+// so the whole pipeline is provably correct before any customer ever sees a
+// real message.
+async function sendWhatsAppNotifications(supabase, createdRows) {
+  const eligible = createdRows.filter(r => WHATSAPP_ELIGIBLE_CATEGORIES.has(r.category));
+  if (eligible.length === 0) return 0;
+
+  const recipientIds = [...new Set(eligible.map(r => r.recipient_user_id))];
+  const { data: recipients, error } = await supabase.from('users')
+    .select('id, phone_number, whatsapp_enabled').in('id', recipientIds);
+  if (error) throw error;
+  const phoneByUserId = new Map((recipients || []).filter(u => u.whatsapp_enabled).map(u => [u.id, u.phone_number]));
+
+  let sent = 0;
+  for (const row of eligible) {
+    const phone = phoneByUserId.get(row.recipient_user_id);
+    if (!phone) continue; // not consented, or consented with no phone on file -- either way, nothing to send to
+    // ?open= isn't interpreted by the frontend yet (no client-side router
+    // exists) -- stored now so the link is already correct once that lands,
+    // rather than backfilling every historical row later.
+    const deepLink = row.deep_link ? `${notifications.APP_URL}/?open=${row.deep_link}` : notifications.APP_URL;
+    const result = await whatsappSender.send({ to: phone, title: row.title, body: row.body, deepLink });
+    const { error: logErr } = await supabase.from('whatsapp_notifications').insert([{
+      recipient_user_id: row.recipient_user_id, notification_id: row.id, category: row.category,
+      title: row.title, body: row.body, deep_link: deepLink,
+      dark_mode: !!result.dark, provider_message_id: result.providerMessageId || null
+    }]);
+    if (logErr) throw logErr;
+    sent += 1;
+  }
+  return sent;
 }
 
 async function runOnce(supabase, todayISO, dryRun) {
@@ -146,15 +200,18 @@ async function runOnce(supabase, todayISO, dryRun) {
   const { toInsert, toInvalidate } = buildDecisions(source, todayISO);
 
   if (dryRun) {
-    console.log(`[runReminders] DRY RUN for ${todayISO}: would reopen elapsed snoozes, apply ${toInvalidate.length} invalidation instruction(s), and attempt ${toInsert.length} candidate insert(s) (actual created count after dedupe may be lower). No rows written.`);
-    return toInsert.length;
+    const wouldBeWhatsApp = toInsert.filter(r => WHATSAPP_ELIGIBLE_CATEGORIES.has(r.category)).length;
+    console.log(`[runReminders] DRY RUN for ${todayISO}: would reopen elapsed snoozes, apply ${toInvalidate.length} invalidation instruction(s), attempt ${toInsert.length} candidate insert(s) (actual created count after dedupe may be lower, and only newly-created rows would reach the WhatsApp step -- up to ${wouldBeWhatsApp} candidate(s) are WhatsApp-eligible by category, further filtered by real dedupe and each recipient's consent). No rows written.`);
+    return { created: toInsert.length, whatsappSent: 0 };
   }
 
   await reopenElapsedSnoozes(supabase, todayISO);
   for (const instr of toInvalidate) {
     await applyInvalidation(supabase, instr);
   }
-  return insertNewNotifications(supabase, toInsert);
+  const createdRows = await insertNewNotifications(supabase, toInsert);
+  const whatsappSent = await sendWhatsAppNotifications(supabase, createdRows);
+  return { created: createdRows.length, whatsappSent };
 }
 
 // injectedSupabase is an optional test-only seam: when provided, main() uses
@@ -171,7 +228,7 @@ async function main(injectedSupabase) {
     if (!url || !key) {
       console.error('[runReminders] Missing required configuration: SUPABASE_URL and/or SUPABASE_SERVICE_ROLE_KEY are not set. Refusing to run. (Not SUPABASE_KEY -- this job requires its own dedicated service-role variable.)');
       process.exitCode = 1;
-      return;
+      return { ok: false, error: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' };
     }
     supabase = createClient(url, key, { realtime: { transport: ws } });
   }
@@ -189,26 +246,27 @@ async function main(injectedSupabase) {
   }
 
   try {
-    const created = await runOnce(supabase, todayISO, DRY_RUN);
+    const { created, whatsappSent } = await runOnce(supabase, todayISO, DRY_RUN);
     if (DRY_RUN) {
       console.log(`[runReminders] Dry run finished cleanly for ${todayISO}.`);
       process.exitCode = 0;
-    } else {
-      const { error } = await supabase.from('reminder_job_runs').update({
-        status: 'success', finished_at: new Date().toISOString(), notifications_created: created
-      }).eq('id', jobRunId);
-      if (error) {
-        // The generation work itself succeeded, but its completion/audit
-        // record did not persist -- a cron run whose own log can't confirm
-        // it finished is not a verified success. Never report success or
-        // exit 0 in this case.
-        console.error('[runReminders] Run completed but failed to record success in reminder_job_runs -- treating as failed for audit purposes:', error.message);
-        process.exitCode = 1;
-      } else {
-        console.log(`[runReminders] Run succeeded for ${todayISO}. Created ${created} notification(s).`);
-        process.exitCode = 0;
-      }
+      return { ok: true, dryRun: true, created, whatsappSent };
     }
+    const { error } = await supabase.from('reminder_job_runs').update({
+      status: 'success', finished_at: new Date().toISOString(), notifications_created: created, whatsapp_sent: whatsappSent
+    }).eq('id', jobRunId);
+    if (error) {
+      // The generation work itself succeeded, but its completion/audit
+      // record did not persist -- a cron run whose own log can't confirm
+      // it finished is not a verified success. Never report success or
+      // exit 0 in this case.
+      console.error('[runReminders] Run completed but failed to record success in reminder_job_runs -- treating as failed for audit purposes:', error.message);
+      process.exitCode = 1;
+      return { ok: false, error: 'Run completed but audit log write failed' };
+    }
+    console.log(`[runReminders] Run succeeded for ${todayISO}. Created ${created} notification(s), ${whatsappSent} WhatsApp dark-send(s).`);
+    process.exitCode = 0;
+    return { ok: true, dryRun: false, created, whatsappSent };
   } catch (err) {
     console.error('[runReminders] Run failed:', err.message);
     if (!DRY_RUN && jobRunId) {
@@ -218,6 +276,7 @@ async function main(injectedSupabase) {
       if (error) console.error('[runReminders] Additionally failed to write the failure log:', error.message);
     }
     process.exitCode = 1;
+    return { ok: false, error: err.message };
   }
 }
 
@@ -231,4 +290,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, runOnce, fetchAll, buildDecisions, reopenElapsedSnoozes, applyInvalidation, insertNewNotifications };
+module.exports = { main, runOnce, fetchAll, buildDecisions, reopenElapsedSnoozes, applyInvalidation, insertNewNotifications, sendWhatsAppNotifications };

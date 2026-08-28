@@ -22,6 +22,7 @@ const { todayISOInTimezone, dueDateForExplicitMonth, daysInMonth } = require('./
 const aiGateway = require('./aiGateway');
 const notifications = require('./notifications');
 const backupCore = require('./backupCore');
+const runReminders = require('./jobs/runReminders');
 
 const app = express();
 
@@ -385,6 +386,32 @@ app.post('/api/admin/backup', async (req, res) => {
   } catch (err) {
     console.error('backup failed:', err.message);
     res.status(500).json({ ok: false, error: 'Backup failed' });
+  }
+});
+
+// Machine-to-machine trigger for the reminder-generation job (see
+// jobs/runReminders.js) -- same shared-secret pattern as /api/admin/backup,
+// and deliberately its OWN secret rather than reusing BACKUP_SECRET, so a
+// leaked trigger secret for one job can't also unlock the other.
+// jobs/runReminders.js's own main() still requires SUPABASE_SERVICE_ROLE_KEY
+// specifically (not the general SUPABASE_KEY this route/file otherwise
+// uses) and refuses to run without it -- that safety property is preserved
+// exactly as originally designed, only the trigger mechanism changed (from
+// a Railway-native cron, never actually provisioned, to this endpoint).
+app.post('/api/admin/run-reminders', async (req, res) => {
+  const provided = req.get('x-reminders-secret') || '';
+  const expected = process.env.REMINDERS_SECRET || '';
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const result = await runReminders.main();
+    res.status(result.ok ? 200 : 500).json(result);
+  } catch (err) {
+    console.error('run-reminders failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Reminder job failed' });
   }
 });
 
