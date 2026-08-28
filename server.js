@@ -24,6 +24,7 @@ const notifications = require('./notifications');
 const backupCore = require('./backupCore');
 const runReminders = require('./jobs/runReminders');
 const razorpayClient = require('./razorpayClient');
+const cashflow = require('./cashflow');
 
 const app = express();
 
@@ -1747,20 +1748,6 @@ app.get('/api/properties/:propertyId/dues', verifyToken, async (req, res) => {
 
 // ===== FINANCIAL COMMAND CENTER (Cash Flow slice) =====
 
-// A payment's `period` should always be set (YYYY-MM-01), but the WhatsApp
-// "record as a payment" apply flow historically didn't send it, leaving
-// period NULL on some already-settled rows. Rather than silently dropping
-// those from every cash-flow total, fall back to payment_date. Range-based
-// (not single-month) so the same function covers both the current-month view
-// and the multi-month year-to-date view -- periods are always stored as
-// first-of-month dates, so a single-month range (monthStart..monthEnd) still
-// only ever matches that one month's period, same as the old exact-equality
-// check this replaces.
-function paymentInRange(payment, rangeStart, rangeEnd) {
-  const d = payment.period || payment.payment_date;
-  return d >= rangeStart && d <= rangeEnd;
-}
-
 // Settled-only operating cash flow (received/paid/net), a 2-month "upcoming/
 // awaiting confirmation" window (reusing reminders.computeDueStatus -- no new
 // due-date logic), open maintenance issues, and deposit status read from the
@@ -1807,42 +1794,10 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
     // range so the identical rule set drives both the current-month view and
     // the year-to-date view below -- no duplicated classification logic
     // between them, and nothing in the frontend re-derives this.
-    const classifySettled = (rangeStart, rangeEnd) => {
-      const settledPayments = (payments || []).filter(p => p.status === 'paid' && paymentInRange(p, rangeStart, rangeEnd));
-      const settledMaintenance = (maintenance || []).filter(m => m.status === 'paid' && m.paid_by === 'owner' && m.cost_date >= rangeStart && m.cost_date <= rangeEnd);
-      let cashReceived = 0, expensesPaid = 0;
-      const transactions = [];
-      const categoryTotalsMap = new Map();
-      const addCategory = (label, amount) => categoryTotalsMap.set(label, (categoryTotalsMap.get(label) || 0) + amount);
-      for (const p of settledPayments) {
-        const obligation = p.obligation_id ? obligationsById.get(p.obligation_id) : null;
-        // An obligation-linked 'paid' payment against an OWNER-paid obligation
-        // (e.g. the owner marking society maintenance paid) is the owner's own
-        // outflow, not income, even though it lives in the same table.
-        const isOwnerPaid = !!(obligation && obligation.paid_by === 'owner');
-        const label = obligation ? obligation.label : 'Payment';
-        const amt = Number(p.amount) || 0;
-        if (isOwnerPaid) {
-          expensesPaid += amt;
-          addCategory(label, amt);
-          transactions.push({ date: p.payment_date, amount: amt, direction: 'expense', label, property_name: propertyName(p.property_id), source: 'payment' });
-        } else {
-          cashReceived += amt;
-          transactions.push({ date: p.payment_date, amount: amt, direction: 'income', label, property_name: propertyName(p.property_id), source: 'payment' });
-        }
-      }
-      for (const m of settledMaintenance) {
-        const amt = Number(m.amount) || 0;
-        expensesPaid += amt;
-        addCategory('Maintenance', amt);
-        transactions.push({ date: m.cost_date, amount: amt, direction: 'expense', label: m.description || (m.vendor_name ? `Maintenance — ${m.vendor_name}` : 'Maintenance'), property_name: propertyName(m.property_id), source: 'maintenance' });
-      }
-      transactions.sort((a, b) => (a.date < b.date ? 1 : -1));
-      const categoryTotals = [...categoryTotalsMap.entries()].map(([label, amount]) => ({ label, amount })).sort((a, b) => b.amount - a.amount);
-      return { cashReceived, expensesPaid, netCashFlow: cashReceived - expensesPaid, transactions, categoryTotals };
-    };
-
-    const monthResult = classifySettled(monthStart, monthEnd);
+    // classifySettled extracted to cashflow.js (2026-08-28) so the CA
+    // export routes below can reuse the identical rule set -- byte-for-byte
+    // the same logic, only the closure captures became explicit params.
+    const monthResult = cashflow.classifySettled({ rangeStart: monthStart, rangeEnd: monthEnd, payments, maintenance, obligationsById, propertyName });
     const { cashReceived, expensesPaid, netCashFlow, transactions, categoryTotals } = monthResult;
 
     // Year-to-date: always the real current calendar year through today,
@@ -1852,7 +1807,7 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
     const today = todayISOInTimezone();
     const ytdYear = today.slice(0, 4);
     const ytdStart = `${ytdYear}-01-01`;
-    const ytdResult = classifySettled(ytdStart, today);
+    const ytdResult = cashflow.classifySettled({ rangeStart: ytdStart, rangeEnd: today, payments, maintenance, obligationsById, propertyName });
 
     // Tenant-paid responsibilities (maintenance/electricity/etc. the tenant
     // pays directly, e.g. from an agreement's responsibility clause) are
@@ -1866,7 +1821,7 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
 
     // ---- Upcoming / awaiting confirmation: this month + next month only, never further ----
     const buildUpcoming = (m, per, start, end) => {
-      const monthPayments = (payments || []).filter(p => paymentInRange(p, start, end));
+      const monthPayments = (payments || []).filter(p => cashflow.paymentInRange(p, start, end));
       return (obligations || []).map(o => {
         const dueDate = dueDateForExplicitMonth(m, o.due_day);
         const { status, payment } = reminders.computeDueStatus({ obligationId: o.id, payments: monthPayments, dueDate, today });
@@ -1883,19 +1838,7 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
       .map(m => ({ id: m.id, property_id: m.property_id, property_name: propertyName(m.property_id), amount: m.amount, cost_date: m.cost_date, description: m.description, vendor_name: m.vendor_name, request_status: m.request_status }));
 
     // ---- Deposits held: existing tenants.deposit_* columns only, no ledger table ----
-    const deposits = (tenants || [])
-      .filter(t => t.deposit_amount)
-      .map(t => {
-        const agreed = Number(t.deposit_amount) || 0;
-        const refunded = Number(t.deposit_refunded_amount) || 0;
-        let status = 'awaiting_confirmation';
-        if (t.deposit_paid_date) status = refunded > 0 ? (refunded >= agreed ? 'refunded' : 'partially_refunded') : 'received';
-        return {
-          tenant_id: t.id, tenant_name: t.name, property_name: propertyName(t.property_id),
-          agreed_amount: agreed, received_date: t.deposit_paid_date || null, received_details: t.deposit_details || null,
-          refunded_amount: t.deposit_refunded_amount || null, refunded_date: t.deposit_refunded_date || null, status
-        };
-      });
+    const deposits = cashflow.computeDeposits({ tenants, propertyName });
 
     res.json({
       month, nextMonth, propertyId,
@@ -1908,6 +1851,133 @@ app.get('/api/cashflow', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('[GET /api/cashflow]', err);
     res.status(500).json({ error: 'Unable to load cash flow.' });
+  }
+});
+
+// ===== CA EXPORT (read-only year-end summary for a chartered accountant) =====
+// Deliberately no new login/auth surface -- the owner downloads/prints this
+// themselves and hands it to their CA directly, rather than the CA getting
+// their own account. Reuses cashflow.js's classification (same rules as the
+// Cash Flow page) over a full financial year instead of a single month.
+
+async function buildCaExportData(userId, startYear) {
+  const fy = cashflow.fiscalYearRange(startYear);
+  const [{ data: properties }, { data: obligations, error: e1 }, { data: payments, error: e2 }, { data: maintenance, error: e3 }, { data: tenants, error: e4 }] = await Promise.all([
+    supabase.from('properties').select('id, property_name').eq('user_id', userId).is('deleted_at', null),
+    supabase.from('obligations').select('id, property_id, paid_by, label, type, amount, due_day').eq('user_id', userId).eq('active', true),
+    supabase.from('payments').select('id, property_id, amount, payment_date, period, status, tenant_id, obligation_id').eq('user_id', userId),
+    supabase.from('maintenance_costs').select('id, property_id, amount, cost_date, status, paid_by, description, vendor_name').eq('user_id', userId),
+    supabase.from('tenants').select('id, property_id, name, deposit_amount, deposit_paid_date, deposit_details, deposit_refunded_amount, deposit_refunded_date').eq('user_id', userId).eq('is_active', true)
+  ]);
+  if (e1) throw e1; if (e2) throw e2; if (e3) throw e3; if (e4) throw e4;
+
+  const propertyName = (id) => (properties || []).find(p => p.id === id)?.property_name || '';
+  const obligationsById = new Map((obligations || []).map(o => [o.id, o]));
+
+  const result = cashflow.classifySettled({ rangeStart: fy.start, rangeEnd: fy.end, payments, maintenance, obligationsById, propertyName });
+  const deposits = cashflow.computeDeposits({ tenants, propertyName });
+  const tds = cashflow.tdsFlags({ obligations, propertyName });
+
+  // Per-property subtotals derived from the same transaction list the
+  // ledger below shows -- no second classification pass, so the two
+  // sections can never disagree with each other.
+  const byProperty = new Map();
+  for (const t of result.transactions) {
+    const key = t.property_name || '(unassigned)';
+    if (!byProperty.has(key)) byProperty.set(key, { property_name: key, income: 0, expenses: 0 });
+    const row = byProperty.get(key);
+    if (t.direction === 'income') row.income += t.amount; else row.expenses += t.amount;
+  }
+  const propertyBreakdown = [...byProperty.values()].map(r => ({ ...r, net: r.income - r.expenses })).sort((a, b) => b.income - a.income);
+
+  return { fy, ...result, deposits, tds, propertyBreakdown };
+}
+
+app.get('/api/reports/ca-export/print', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const startYear = /^\d{4}$/.test(req.query.year || '') ? Number(req.query.year) : cashflow.currentFiscalYearStart(todayISOInTimezone());
+    const [{ data: owner }, data] = await Promise.all([
+      supabase.from('users').select('full_name,email').eq('id', req.userId).single(),
+      buildCaExportData(req.userId, startYear)
+    ]);
+    const { fy, cashReceived, expensesPaid, netCashFlow, transactions, propertyBreakdown, deposits, tds } = data;
+
+    const rows = transactions.map(t => `<tr><td>${t.date}</td><td>${t.property_name}</td><td>${t.label}</td><td style="text-align:right;color:${t.direction === 'income' ? '#166534' : '#991b1b'}">${t.direction === 'income' ? '+' : '−'}₹${t.amount.toLocaleString('en-IN')}</td></tr>`).join('');
+    const propRows = propertyBreakdown.map(p => `<tr><td>${p.property_name}</td><td style="text-align:right">₹${p.income.toLocaleString('en-IN')}</td><td style="text-align:right">₹${p.expenses.toLocaleString('en-IN')}</td><td style="text-align:right;font-weight:600">₹${p.net.toLocaleString('en-IN')}</td></tr>`).join('');
+    const depositRows = deposits.map(d => `<tr><td>${d.tenant_name}</td><td>${d.property_name}</td><td style="text-align:right">₹${d.agreed_amount.toLocaleString('en-IN')}</td><td>${d.status.replace(/_/g, ' ')}</td></tr>`).join('');
+    const tdsNote = tds.length ? `<div class="box" style="border-color:#f59e0b;background:#fffbeb"><b>Note</b><ul>${tds.map(t => `<li>${t.property_name}: ₹${t.monthly_rent.toLocaleString('en-IN')}/mo — ${t.note}</li>`).join('')}</ul></div>` : '';
+
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>OMniNivas — CA Export ${fy.label}</title>
+<style>
+body{font-family:Georgia,serif;max-width:800px;margin:2.5rem auto;color:#1f2937;padding:0 1rem}
+h1{color:#1e3a5f;font-size:1.5rem;border-bottom:2px solid #f97316;padding-bottom:.5rem}
+h2{color:#1e3a5f;font-size:1.05rem;margin-top:2rem}
+.box{border:1px solid #d1d5db;border-radius:8px;padding:1rem 1.25rem;margin-top:.75rem}
+table{width:100%;border-collapse:collapse;margin-top:.5rem;font-size:.85rem}
+th{text-align:left;border-bottom:1px solid #9ca3af;padding:.4rem}
+td{padding:.35rem .4rem;border-bottom:1px solid #e5e7eb}
+.summary{display:flex;gap:1.5rem;margin-top:.75rem}
+.summary div{flex:1;text-align:center;border:1px solid #d1d5db;border-radius:8px;padding:.75rem}
+.summary .n{font-size:1.3rem;font-weight:bold}
+.foot{margin-top:2rem;font-size:.78rem;color:#6b7280}
+@media print{.noprint{display:none}}
+</style></head><body>
+<h1>OMniNivas — Financial Summary for Your Chartered Accountant</h1>
+<p>Owner: ${owner ? (owner.full_name || owner.email) : ''} · Financial Year: ${fy.label} (${fy.start} to ${fy.end}) · Generated ${new Date().toLocaleDateString('en-IN')}</p>
+
+<div class="summary">
+  <div><div>Rent &amp; income received</div><div class="n" style="color:#166534">₹${cashReceived.toLocaleString('en-IN')}</div></div>
+  <div><div>Expenses paid</div><div class="n" style="color:#991b1b">₹${expensesPaid.toLocaleString('en-IN')}</div></div>
+  <div><div>Net cash flow</div><div class="n">₹${netCashFlow.toLocaleString('en-IN')}</div></div>
+</div>
+
+${tdsNote}
+
+<h2>By property</h2>
+<table><tr><th>Property</th><th style="text-align:right">Income</th><th style="text-align:right">Expenses</th><th style="text-align:right">Net</th></tr>${propRows || '<tr><td colspan="4">No properties with recorded transactions this year.</td></tr>'}</table>
+
+<h2>Security deposits held</h2>
+<table><tr><th>Tenant</th><th>Property</th><th style="text-align:right">Agreed amount</th><th>Status</th></tr>${depositRows || '<tr><td colspan="4">No deposits on record.</td></tr>'}</table>
+
+<h2>Transaction ledger (${transactions.length})</h2>
+<table><tr><th>Date</th><th>Property</th><th>Description</th><th style="text-align:right">Amount</th></tr>${rows || '<tr><td colspan="4">No transactions this year.</td></tr>'}</table>
+
+<p class="foot">Generated by OMniNivas on ${new Date().toLocaleDateString('en-IN')}. This is an arithmetic summary of transactions recorded in OMniNivas — not tax or accounting advice. Verify all figures, including any TDS note above, with your chartered accountant.</p>
+<p class="noprint" style="text-align:center;margin-top:1rem"><button onclick="window.print()" style="padding:.6rem 2rem;font-size:1rem;cursor:pointer">Print / Save as PDF</button></p>
+</body></html>`);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/reports/ca-export/csv', verifyToken, requireOwner, async (req, res) => {
+  try {
+    const startYear = /^\d{4}$/.test(req.query.year || '') ? Number(req.query.year) : cashflow.currentFiscalYearStart(todayISOInTimezone());
+    const data = await buildCaExportData(req.userId, startYear);
+    const { fy, transactions, propertyBreakdown, cashReceived, expensesPaid, netCashFlow } = data;
+
+    const esc = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
+    const lines = [];
+    lines.push(esc(`OMniNivas CA Export — ${fy.label} (${fy.start} to ${fy.end})`));
+    lines.push('');
+    lines.push(esc('Summary'));
+    lines.push(`${esc('Income')},${cashReceived}`);
+    lines.push(`${esc('Expenses')},${expensesPaid}`);
+    lines.push(`${esc('Net')},${netCashFlow}`);
+    lines.push('');
+    lines.push(esc('By property'));
+    lines.push(['Property', 'Income', 'Expenses', 'Net'].map(esc).join(','));
+    for (const p of propertyBreakdown) lines.push([p.property_name, p.income, p.expenses, p.net].map(esc).join(','));
+    lines.push('');
+    lines.push(esc('Transactions'));
+    lines.push(['Date', 'Property', 'Description', 'Direction', 'Amount'].map(esc).join(','));
+    for (const t of transactions) lines.push([t.date, t.property_name, t.label, t.direction, t.amount].map(esc).join(','));
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="omninivas-ca-export-${fy.label.replace(/\s+/g, '-')}.csv"`);
+    res.send(lines.join('\n'));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
