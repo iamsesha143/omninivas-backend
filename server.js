@@ -23,6 +23,7 @@ const aiGateway = require('./aiGateway');
 const notifications = require('./notifications');
 const backupCore = require('./backupCore');
 const runReminders = require('./jobs/runReminders');
+const razorpayClient = require('./razorpayClient');
 
 const app = express();
 
@@ -41,7 +42,13 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json({ limit: '50mb' }));
+// `verify` captures the exact raw bytes alongside the normal parsed body --
+// needed for the Razorpay webhook route's HMAC signature check, which must
+// be computed over the raw request body, never a re-stringified req.body
+// (JSON.stringify can reorder/reformat in ways that change the byte
+// sequence and silently break a correct signature). No effect on any other
+// route; req.rawBody is simply unused everywhere else.
+app.use(express.json({ limit: '50mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Custom express-rate-limit Store backed by Upstash, using only plain
@@ -1010,6 +1017,63 @@ app.post('/api/properties/:propertyId/payments', verifyToken, async (req, res) =
     res.status(201).json(data[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Razorpay's own webhook, not gated by the shared x-*-secret pattern used
+// elsewhere in this file -- Razorpay itself is the caller, authenticated by
+// its own HMAC signature (razorpayClient.verifyWebhookSignature), the
+// standard mechanism for third-party webhooks. Returns 503 while
+// RAZORPAY_WEBHOOK_SECRET is unset (today): nobody legitimate can be
+// calling this yet, since no real webhook has ever been pointed at it.
+// req.rawBody comes from the express.json() verify hook above -- signature
+// verification must run against the exact raw bytes Razorpay sent, not the
+// parsed-then-reserialized req.body.
+//
+// reference_id on the Payment Link (set at creation time, once
+// razorpayClient.createPaymentLink() has a real implementation) is expected
+// to be "<obligation_id>:<period>" -- this webhook only ever needs to
+// resolve which obligation/period a payment belongs to, not carry any other
+// state, so that's the whole design of the reference format.
+app.post('/api/webhooks/razorpay', async (req, res) => {
+  if (!razorpayClient.webhooksConfigured()) {
+    return res.status(503).json({ error: 'Razorpay webhooks not configured' });
+  }
+  if (!razorpayClient.verifyWebhookSignature(req.rawBody, req.get('x-razorpay-signature'))) {
+    return res.status(400).json({ error: 'Invalid signature' });
+  }
+  try {
+    if (req.body.event !== 'payment_link.paid') {
+      // Acknowledged, not an error -- Razorpay retries on non-2xx, and this
+      // integration only acts on the one event type it's built around.
+      return res.status(200).json({ ok: true, ignored: req.body.event });
+    }
+    const paymentEntity = req.body.payload?.payment?.entity;
+    const linkEntity = req.body.payload?.payment_link?.entity;
+    const [obligationId, period] = (linkEntity?.reference_id || '').split(':');
+    if (!paymentEntity?.id || !obligationId || !/^\d{4}-\d{2}-01$/.test(period || '')) {
+      return res.status(400).json({ error: 'Malformed payload' });
+    }
+
+    const { data: obligation, error: obErr } = await supabase.from('obligations')
+      .select('id, property_id, user_id').eq('id', obligationId).maybeSingle();
+    if (obErr) throw obErr;
+    if (!obligation) return res.status(200).json({ ok: true, ignored: 'unknown obligation reference' });
+
+    const { data, error } = await supabase.from('payments')
+      .upsert([{
+        property_id: obligation.property_id, user_id: obligation.user_id, obligation_id: obligation.id,
+        period, amount: paymentEntity.amount / 100, payment_date: new Date().toISOString().slice(0, 10),
+        payment_type: 'rent', payment_method: 'razorpay', status: 'paid',
+        razorpay_payment_id: paymentEntity.id, razorpay_payment_link_id: linkEntity.id
+      }], { onConflict: 'razorpay_payment_id', ignoreDuplicates: true })
+      .select('id');
+    if (error) throw error;
+
+    res.status(200).json({ ok: true, created: (data || []).length > 0 });
+  } catch (err) {
+    console.error('razorpay webhook failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Webhook processing failed' });
   }
 });
 
