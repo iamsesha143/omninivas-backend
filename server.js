@@ -314,7 +314,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 // Works for both owner and tenant logins — both are rows in `users`, distinguished by `role`.
 app.get('/api/auth/me', verifyToken, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('users').select('id, email, full_name, role, email_enabled').eq('id', req.userId).single();
+    const { data, error } = await supabase.from('users').select('id, email, full_name, role, email_enabled, whatsapp_enabled').eq('id', req.userId).single();
     if (error || !data) return res.status(404).json({ error: 'User not found' });
     res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -324,7 +324,11 @@ app.patch('/api/auth/me/preferences', verifyToken, async (req, res) => {
   try {
     const allowed = {};
     if (req.body.email_enabled !== undefined) allowed.email_enabled = req.body.email_enabled;
-    const { data, error } = await supabase.from('users').update(allowed).eq('id', req.userId).select('id, email, full_name, role, email_enabled');
+    // whatsapp_enabled is a DPDP consent flag, not an ordinary preference --
+    // the frontend only ever sends true after showing the full disclosure
+    // (sender, message categories, opt-out), never as a silent default.
+    if (req.body.whatsapp_enabled !== undefined) allowed.whatsapp_enabled = req.body.whatsapp_enabled;
+    const { data, error } = await supabase.from('users').update(allowed).eq('id', req.userId).select('id, email, full_name, role, email_enabled, whatsapp_enabled');
     if (error) throw error;
     res.json(data[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
