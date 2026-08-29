@@ -952,16 +952,35 @@ app.get('/api/properties/:propertyId/tenants', verifyToken, async (req, res) => 
   }
 });
 
-app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.single('file'), async (req, res) => {
+// 'deed' kept as a legacy alias (not removed) so every already-uploaded
+// storage object with the old deed_<timestamp>_<name> key still parses and
+// displays correctly -- see the GET route below. New uploads should use a
+// real category; 'sale_deed' is the one this Phase 5 pass was specifically
+// added for (ties to the mortgage/loan feature, which needs proof-of-
+// ownership documentation), 'agreement'/'tax_receipt'/'insurance'/'other'
+// cover the rest of what a property's document vault realistically holds.
+const PROPERTY_DOCUMENT_TYPES = ['deed', 'sale_deed', 'agreement', 'tax_receipt', 'insurance', 'other'];
+
+app.post('/api/properties/:propertyId/documents/:docType', verifyToken, upload.single('file'), async (req, res) => {
   try {
+    if (!PROPERTY_DOCUMENT_TYPES.includes(req.params.docType)) {
+      return res.status(400).json({ error: `docType must be one of: ${PROPERTY_DOCUMENT_TYPES.join(', ')}` });
+    }
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
     const validation = uploadValidation.validateUploadedFile(req.file, uploadValidation.DOCUMENT_UPLOAD_RULE);
     if (!validation.valid) return res.status(400).json({ error: validation.error });
+    // Ownership check was missing here entirely before this fix -- any
+    // authenticated owner could upload to (or, in the GET route below, list
+    // documents from) ANY propertyId, not just their own. Same gap class as
+    // the tenant-write authorization issue found and fixed 2026-08-12,
+    // just never audited on this route until now.
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+    if (!property) return notFound(res);
     // The original filename is encoded straight into the storage key (Supabase
     // Storage's .list() doesn't reliably surface custom upload metadata) so the
     // listing route below can recover a real title instead of a bare timestamp.
     const safeName = (req.file.originalname || 'document').replace(/[^a-zA-Z0-9.\-_ ]/g, '_').slice(0, 100);
-    const fileName = `properties/${req.params.propertyId}/deed_${Date.now()}_${safeName}`;
+    const fileName = `properties/${req.params.propertyId}/${req.params.docType}_${Date.now()}_${safeName}`;
     const { error } = await supabase.storage.from('documents').upload(fileName, req.file.buffer, { contentType: req.file.mimetype, metadata: { user_id: req.userId } });
     if (error) throw error;
     const { data: signed } = await supabase.storage.from('documents').createSignedUrl(fileName, 3600);
@@ -973,18 +992,22 @@ app.post('/api/properties/:propertyId/documents/deed', verifyToken, upload.singl
 
 app.get('/api/properties/:propertyId/documents', verifyToken, async (req, res) => {
   try {
+    const { data: property } = await supabase.from('properties').select('id').eq('id', req.params.propertyId).eq('user_id', req.userId).is('deleted_at', null).maybeSingle();
+    if (!property) return notFound(res);
+
     const { data, error } = await supabase.storage.from('documents').list(`properties/${req.params.propertyId}`, { limit: 100, sortBy: { column: 'created_at', order: 'desc' } });
     if (error) throw error;
     const files = [];
     for (const f of (data || [])) {
       const path = `properties/${req.params.propertyId}/${f.name}`;
       const { data: signed } = await supabase.storage.from('documents').createSignedUrl(path, 3600);
-      // Recover the readable filename encoded into the key at upload time.
-      // Older files (uploaded before this) won't match and fall back to a
-      // plain label rather than showing the raw storage key (a timestamp).
-      const m = f.name.match(/^deed_\d+_(.+)$/);
+      // Recover the type + readable filename encoded into the key at upload
+      // time. A file uploaded before this docType generalization has no
+      // recognized prefix at all and falls back to a plain label, same as
+      // before.
+      const m = f.name.match(new RegExp(`^(${PROPERTY_DOCUMENT_TYPES.join('|')})_\\d+_(.+)$`));
       files.push({
-        name: f.name, title: m ? m[1] : 'Property document', type: 'deed',
+        name: f.name, title: m ? m[2] : 'Property document', type: m ? m[1] : 'other',
         created_at: f.created_at, size: f.metadata?.size, url: signed?.signedUrl || null
       });
     }

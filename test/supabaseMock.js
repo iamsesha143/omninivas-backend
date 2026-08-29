@@ -9,7 +9,7 @@ function createMockSupabase() {
   const queues = {};
   const inserts = {};
   const updates = {};
-  const storage = { uploaded: [], removed: [], uploadFailAt: null, uploadCallCount: 0 };
+  const storage = { uploaded: [], removed: [], uploadFailAt: null, uploadCallCount: 0, listResult: null };
 
   function dequeue(table) {
     const q = queues[table];
@@ -66,10 +66,10 @@ function createMockSupabase() {
             return { data: paths, error: null };
           },
           // Used by GET /api/properties/:propertyId/documents (server.js).
-          // Always returns an empty listing -- no existing test exercises
-          // that route's file-listing behavior, only that routes calling
-          // .list() don't crash for lack of a mock.
-          list: async () => ({ data: [], error: null }),
+          // Defaults to an empty listing; set __storage.listResult =
+          // {data, error} before a request to control what a specific test
+          // sees, then reset it to null afterward (or rely on __reset()).
+          list: async () => storage.listResult || { data: [], error: null },
           createSignedUrl: async (path) => ({ data: { signedUrl: `https://mock-signed-url.test/${path}` }, error: null })
         };
       }
@@ -93,6 +93,7 @@ function createMockSupabase() {
       storage.removed = [];
       storage.uploadFailAt = null;
       storage.uploadCallCount = 0;
+      storage.listResult = null;
     },
     __storage: storage
   };

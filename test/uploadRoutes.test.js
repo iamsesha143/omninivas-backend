@@ -88,6 +88,7 @@ test('documents/deed: video MIME is rejected before any storage call', async () 
 });
 
 test('documents/deed: valid PDF is accepted and stored', async () => {
+  mockDb.__queue('properties', { data: { id: 'prop-1' }, error: null });
   const form = new FormData();
   form.append('file', new Blob([PDF_BYTES], { type: 'application/pdf' }), 'deed.pdf');
   const res = await api('POST', '/api/properties/prop-1/documents/deed', { token: ownerToken, form });
@@ -97,6 +98,7 @@ test('documents/deed: valid PDF is accepted and stored', async () => {
 });
 
 test('documents/deed: valid JPEG is accepted', async () => {
+  mockDb.__queue('properties', { data: { id: 'prop-1' }, error: null });
   const form = new FormData();
   form.append('file', new Blob([JPEG_BYTES], { type: 'image/jpeg' }), 'deed.jpg');
   const res = await api('POST', '/api/properties/prop-1/documents/deed', { token: ownerToken, form });
@@ -104,12 +106,29 @@ test('documents/deed: valid JPEG is accepted', async () => {
 });
 
 test('documents/deed: a storage failure returns an honest error, not a false success', async () => {
+  mockDb.__queue('properties', { data: { id: 'prop-1' }, error: null });
   mockDb.__storage.uploadFailAt = 1;
   const form = new FormData();
   form.append('file', new Blob([PDF_BYTES], { type: 'application/pdf' }), 'deed.pdf');
   const res = await api('POST', '/api/properties/prop-1/documents/deed', { token: ownerToken, form });
   assert.notEqual(res.status, 200);
   assert.notEqual(res.body?.success, true);
+});
+
+test('documents/deed: a propertyId not owned by the caller (or nonexistent) is a generic 404, no upload attempted', async () => {
+  mockDb.__queue('properties', { data: null, error: null });
+  const form = new FormData();
+  form.append('file', new Blob([PDF_BYTES], { type: 'application/pdf' }), 'deed.pdf');
+  const res = await api('POST', '/api/properties/not-mine/documents/deed', { token: ownerToken, form });
+  assert.equal(res.status, 404);
+  assert.equal(mockDb.__storage.uploaded.length, 0);
+});
+
+test('documents/deed: an invalid docType is rejected with 400, ownership never checked', async () => {
+  const form = new FormData();
+  form.append('file', new Blob([PDF_BYTES], { type: 'application/pdf' }), 'deed.pdf');
+  const res = await api('POST', '/api/properties/prop-1/documents/not_a_real_type', { token: ownerToken, form });
+  assert.equal(res.status, 400);
 });
 
 // ---- POST /api/properties/:propertyId/tenants/:tenantId/documents/:docType ----
