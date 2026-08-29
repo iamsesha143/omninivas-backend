@@ -11,7 +11,7 @@ const mw = require('./maintenanceWorkflow');
 
 const CATEGORIES = [
   'warranty_expiry', 'agreement_renewal', 'rent_due', 'rent_overdue',
-  'maintenance_urgent', 'settlement_pending'
+  'maintenance_urgent', 'settlement_pending', 'property_tax_due'
 ];
 
 // ---- Dedupe identity ----
@@ -126,6 +126,13 @@ function isApplianceWarrantyEligible(appliance) {
 function isPropertyAgreementEligible(property) {
   return !property.deleted_at && !!property.agreement_start_date;
 }
+// Property tax is a real recurring annual event, but modeled here as a
+// single date the owner updates once a year (same manual-recurrence
+// pattern as the mortgage spike's loan tracking) -- simpler than building
+// annual-recurrence math for something that changes once a year at most.
+function isPropertyTaxEligible(property) {
+  return !property.deleted_at && !!property.property_tax_due_date;
+}
 function isMaintenanceUrgentEligible(cost) {
   return cost.urgency === 'high' && !mw.isTerminalRequestStatus(cost.request_status);
 }
@@ -145,6 +152,10 @@ const copy = {
   agreement_renewal: (p, endDate) => ({
     title: `Agreement renewal: ${p.property_name}`,
     body: `The rental agreement for ${p.property_name} ends on ${endDate}.`
+  }),
+  property_tax_due: (p, dueDate) => ({
+    title: `Property tax due: ${p.property_name}`,
+    body: `Property tax for ${p.property_name} is due on ${dueDate}.`
   }),
   rent_due: (o, dueDate) => ({
     title: 'Rent due soon',
@@ -228,6 +239,35 @@ function generateAgreementRenewal({ properties, todayISO }) {
         dedupe_key: buildDedupeKey({ category: 'agreement_renewal', source_type: 'property', source_id: p.id, offset_label, event_date: eventDate, recipient_user_id: p.user_id }),
         status: 'unread',
         title: c.title, body: c.body, deep_link: 'tenants'
+      });
+    }
+  }
+  return { toInsert, toInvalidate };
+}
+
+// Byte-for-byte the same shape as generateAgreementRenewal above -- same
+// ladder, same catch-up/no-reminders-after-expiry rule -- just against
+// property_tax_due_date instead of the computed agreement end date.
+function generatePropertyTaxDue({ properties, todayISO }) {
+  const toInsert = [], toInvalidate = [];
+  for (const p of properties) {
+    if (!isPropertyTaxEligible(p)) {
+      toInvalidate.push({ source_type: 'property', source_id: p.id, category: 'property_tax_due', reason: 'source_date_changed' });
+      continue;
+    }
+    const eventDate = p.property_tax_due_date;
+    toInvalidate.push({ source_type: 'property', source_id: p.id, category: 'property_tax_due', reason: 'source_date_changed', excludeEventDate: eventDate });
+    if (eventDate < todayISO) continue;
+    for (const { offset_label, scheduled_for, trigger_offset_days } of computeMonthOrDayLadder(eventDate, WARRANTY_AGREEMENT_LADDER)) {
+      if (scheduled_for > todayISO) continue;
+      const c = copy.property_tax_due(p, eventDate);
+      toInsert.push({
+        recipient_user_id: p.user_id, recipient_role: 'owner', property_id: p.id,
+        category: 'property_tax_due', source_type: 'property', source_id: p.id,
+        event_date: eventDate, offset_label, trigger_offset_days, scheduled_for,
+        dedupe_key: buildDedupeKey({ category: 'property_tax_due', source_type: 'property', source_id: p.id, offset_label, event_date: eventDate, recipient_user_id: p.user_id }),
+        status: 'unread',
+        title: c.title, body: c.body, deep_link: 'properties'
       });
     }
   }
@@ -409,7 +449,7 @@ module.exports = {
   computeMonthOrDayLadder, computeDayLadder,
   computeDueStatus, dueStatusWarrantsReminder,
   currentOrUpcomingDueDate, mostRecentPastDueDate, computeAgreementEndDate,
-  isApplianceWarrantyEligible, isPropertyAgreementEligible, isMaintenanceUrgentEligible, isSettlementPendingEligible,
-  generateWarrantyExpiry, generateAgreementRenewal, generateRentDue, generateRentOverdue,
+  isApplianceWarrantyEligible, isPropertyAgreementEligible, isPropertyTaxEligible, isMaintenanceUrgentEligible, isSettlementPendingEligible,
+  generateWarrantyExpiry, generateAgreementRenewal, generatePropertyTaxDue, generateRentDue, generateRentOverdue,
   generateMaintenanceUrgent, generateSettlementPending, invalidateInactiveTenantRentDue
 };

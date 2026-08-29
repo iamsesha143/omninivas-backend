@@ -563,7 +563,7 @@ app.patch('/api/properties/:id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: `property_type must be one of: ${PROPERTY_TYPES.join(', ')}` });
     }
     const allowed = {};
-    for (const k of ['property_name', 'street_address', 'city', 'state', 'pincode', 'flat_number', 'society_name', 'property_type', 'agreement_start_date', 'agreement_months']) {
+    for (const k of ['property_name', 'street_address', 'city', 'state', 'pincode', 'flat_number', 'society_name', 'property_type', 'agreement_start_date', 'agreement_months', 'property_tax_due_date']) {
       if (req.body[k] !== undefined) allowed[k] = req.body[k];
     }
     const { data, error } = await supabase.from('properties').update(allowed).eq('id', req.params.id).eq('user_id', req.userId).select();

@@ -51,7 +51,7 @@ async function fetchAll(supabase) {
     // just became ineligible (e.g. urgency edited away from 'high') from
     // ever being invalidated, since it would no longer even be fetched.
     supabase.from('appliances').select('id, property_id, user_id, name, warranty_end, condition_status'),
-    supabase.from('properties').select('id, user_id, property_name, agreement_start_date, agreement_months, deleted_at'),
+    supabase.from('properties').select('id, user_id, property_name, agreement_start_date, agreement_months, property_tax_due_date, deleted_at'),
     supabase.from('obligations').select('id, property_id, user_id, label, amount, due_day, paid_by, active').eq('active', true).eq('paid_by', 'tenant'),
     supabase.from('payments').select('id, obligation_id, period, status'),
     supabase.from('tenants').select('id, property_id, user_id, login_user_id, is_active'),
@@ -95,6 +95,7 @@ function buildDecisions(source, todayISO) {
   const parts = [
     reminders.generateWarrantyExpiry({ appliances, activePropertyIds, todayISO }),
     reminders.generateAgreementRenewal({ properties, todayISO }),
+    reminders.generatePropertyTaxDue({ properties, todayISO }),
     reminders.generateRentDue({ obligations, tenantsByPropertyId, paymentsByObligationId, todayISO }),
     reminders.generateRentOverdue({ obligations, propertiesById, paymentsByObligationId, todayISO }),
     reminders.generateMaintenanceUrgent({ costs: maintenanceCosts, propertiesById, todayISO }),

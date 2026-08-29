@@ -217,6 +217,41 @@ test('generateAgreementRenewal: skips soft-deleted properties and invalidates in
   assert.ok(toInvalidate.some(i => i.source_id === 'p1' && i.reason === 'source_date_changed'));
 });
 
+// ---- Generators: property_tax_due (same shape as agreement_renewal, direct
+// date field instead of a computed end date) ----
+
+test('generatePropertyTaxDue: matches the earliest ladder slot on its exact day', () => {
+  const properties = [{ id: 'p1', user_id: 'owner-1', property_name: 'Flat 3B', property_tax_due_date: '2026-12-15', deleted_at: null }];
+  const { toInsert } = r.generatePropertyTaxDue({ properties, todayISO: '2026-10-15' });
+  assert.equal(toInsert.length, 1);
+  assert.equal(toInsert[0].offset_label, '2_months');
+  assert.equal(toInsert[0].event_date, '2026-12-15');
+  assert.equal(toInsert[0].recipient_role, 'owner');
+  assert.equal(toInsert[0].category, 'property_tax_due');
+});
+
+test('generatePropertyTaxDue: catch-up creates every slot whose moment has passed, none after expiry', () => {
+  const properties = [{ id: 'p1', user_id: 'owner-1', property_name: 'Flat 3B', property_tax_due_date: '2026-12-15', deleted_at: null }];
+  const { toInsert } = r.generatePropertyTaxDue({ properties, todayISO: '2026-11-15' });
+  assert.deepEqual(toInsert.map(n => n.offset_label).sort(), ['1_month', '2_months']);
+
+  const afterExpiry = r.generatePropertyTaxDue({ properties, todayISO: '2027-01-10' });
+  assert.equal(afterExpiry.toInsert.length, 0);
+});
+
+test('generatePropertyTaxDue: a property with no property_tax_due_date is simply ineligible, not an error', () => {
+  const properties = [{ id: 'p1', user_id: 'owner-1', property_name: 'Flat 3B', property_tax_due_date: null, deleted_at: null }];
+  const { toInsert, toInvalidate } = r.generatePropertyTaxDue({ properties, todayISO: '2026-11-15' });
+  assert.equal(toInsert.length, 0);
+  assert.ok(toInvalidate.some(i => i.source_id === 'p1' && i.reason === 'source_date_changed'));
+});
+
+test('generatePropertyTaxDue: skips soft-deleted properties', () => {
+  const properties = [{ id: 'p1', user_id: 'owner-1', property_name: 'Flat 3B', property_tax_due_date: '2026-12-15', deleted_at: '2026-06-01T00:00:00Z' }];
+  const { toInsert } = r.generatePropertyTaxDue({ properties, todayISO: '2026-11-15' });
+  assert.equal(toInsert.length, 0);
+});
+
 // ---- Generators: rent_due (fan-out + suppression) ----
 
 test('generateRentDue: fans out one notification per active, logged-in tenant', () => {
