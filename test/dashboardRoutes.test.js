@@ -75,6 +75,38 @@ test('GET /api/dashboard: no tenants at all -> occupiedProperties is 0', async (
   assert.equal(res.body.totalProperties, 2);
 });
 
+const daysAgoISO = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+
+test('GET /api/dashboard: a tenant moved in 10+ days ago with police verification still pending is flagged', async () => {
+  queueDashboard(mockDb, {
+    properties: [{ id: 'p-1', property_name: 'A' }],
+    tenants: [{ id: 't-1', name: 'Alice', property_id: 'p-1', date_of_move_in: daysAgoISO(10), police_verification_status: 'pending' }]
+  });
+  const res = await api('/api/dashboard', ownerToken());
+  assert.equal(res.status, 200);
+  assert.equal(res.body.policeVerificationPending.length, 1);
+  assert.equal(res.body.policeVerificationPending[0].tenant, 'Alice');
+  assert.ok(res.body.policeVerificationPending[0].days_since_move_in >= 10);
+});
+
+test('GET /api/dashboard: a tenant moved in only 3 days ago is not flagged yet (under the 7-day threshold)', async () => {
+  queueDashboard(mockDb, {
+    properties: [{ id: 'p-1', property_name: 'A' }],
+    tenants: [{ id: 't-1', name: 'Alice', property_id: 'p-1', date_of_move_in: daysAgoISO(3), police_verification_status: 'pending' }]
+  });
+  const res = await api('/api/dashboard', ownerToken());
+  assert.equal(res.body.policeVerificationPending.length, 0);
+});
+
+test('GET /api/dashboard: a tenant marked done is never flagged, regardless of how long ago they moved in', async () => {
+  queueDashboard(mockDb, {
+    properties: [{ id: 'p-1', property_name: 'A' }],
+    tenants: [{ id: 't-1', name: 'Alice', property_id: 'p-1', date_of_move_in: daysAgoISO(60), police_verification_status: 'done' }]
+  });
+  const res = await api('/api/dashboard', ownerToken());
+  assert.equal(res.body.policeVerificationPending.length, 0);
+});
+
 test('GET /api/dashboard: two active tenants on the same property count as one occupied property', async () => {
   queueDashboard(mockDb, {
     properties: [{ id: 'p-1', property_name: 'A' }],

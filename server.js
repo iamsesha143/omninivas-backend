@@ -2880,7 +2880,7 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
     const [{ data: props }, { data: tenants }, { data: payments }, { data: maintenance }, { data: obligations }, { data: monthPayments }] = await Promise.all([
       supabase.from('properties').select('id,property_name').eq('user_id', req.userId).is('deleted_at', null),
-      supabase.from('tenants').select('id,name,property_id,date_of_move_in,expected_date_of_move_out,actual_date_of_move_out').eq('user_id', req.userId).eq('is_active', true),
+      supabase.from('tenants').select('id,name,property_id,date_of_move_in,expected_date_of_move_out,actual_date_of_move_out,police_verification_status').eq('user_id', req.userId).eq('is_active', true),
       supabase.from('payments').select('amount').eq('user_id', req.userId).eq('status', 'paid'),
       supabase.from('maintenance_costs').select('amount').eq('user_id', req.userId).eq('status', 'pending'),
       supabase.from('obligations').select('*').eq('user_id', req.userId).eq('active', true),
@@ -2931,6 +2931,18 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
       }
     }
 
+    // Police verification pending -- Karnataka-mandatory for the Bengaluru
+    // first wave (competitor gap #1, 2026-08-28 research). Flagged once a
+    // tenant has been moved in for 7+ days and still isn't marked 'done';
+    // the field itself has existed since before this feature (tenants.
+    // police_verification_status), this is the first time it's ever
+    // surfaced as an actionable "Now" item rather than just an edit-form
+    // dropdown nobody is prompted to look at.
+    const policeVerificationPending = (tenants || [])
+      .filter(t => t.police_verification_status !== 'done' && t.date_of_move_in)
+      .map(t => ({ tenant: t.name, property_id: t.property_id, days_since_move_in: -daysUntil(t.date_of_move_in) }))
+      .filter(t => t.days_since_move_in >= 7);
+
     // Portfolio Overview occupancy: a property counts as occupied when it has
     // at least one active tenant. Reuses the `tenants` rows already fetched
     // above (active-only) -- no extra query, dedup via Set since one property
@@ -2946,7 +2958,8 @@ app.get('/api/dashboard', verifyToken, async (req, res) => {
       duesThisMonth: { month, total: (obligations || []).length, paid: duesPaid, pending: duesPending, overdue: duesOverdue },
       renewals: renewals.sort((a, b) => a.days_left - b.days_left),
       warrantyAlerts: warranties.sort((a, b) => a.days_left - b.days_left),
-      movements: movements.sort((a, b) => a.days_left - b.days_left)
+      movements: movements.sort((a, b) => a.days_left - b.days_left),
+      policeVerificationPending: policeVerificationPending.sort((a, b) => b.days_since_move_in - a.days_since_move_in)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
